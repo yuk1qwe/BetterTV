@@ -186,4 +186,20 @@
     <string name="weberin_settings_sound">Sound</string>
     <string name="weberin_settings_themes">Themes</string>
     <string name="weberin_settings_other">Other</string>
+    <string name="weberin_move_left">Move left</string>
+    <string name="weberin_move_right">Move right</string>
+    <string name="weberin_weather_title">Weather</string>
+    <string name="weberin_weather_city">City</string>
+    <string name="weberin_weather_default_city">Saint Petersburg</string>
+    <string name="weberin_weather_invalid_city">Enter a city name (2–80 characters)</string>
+    <string name="weberin_weather_loading">Loading…</string>
+    <string name="weberin_weather_unavailable">Weather unavailable</string>
+    <string name="weberin_weather_humidity">Humidity %1$d%%</string>
+    <string name="weberin_weather_range">Min. %1$d°   Max. %2$d°</string>
+    <string name="weberin_weather_clear">Clear</string>
+    <string name="weberin_weather_cloudy">Cloudy</string>
+    <string name="weberin_weather_fog">Fog</string>
+    <string name="weberin_weather_rain">Rain</string>
+    <string name="weberin_weather_snow">Snow</string>
+    <string name="weberin_weather_storm">Thunderstorm</string>
 </resources>

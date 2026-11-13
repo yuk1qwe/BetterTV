@@ -36,6 +36,7 @@ Themes set the same keys plus a background colour and a wallpaper.
 
 Click **Settings** for the TV's own settings. Hold OK on it for its menu:
 
+- **Weberin TV** switches from the original screen back to the Weberin screen.
 - **Launcher settings**. With `launcher_settings_button` a click opens those instead, and the menu
   leaves the row out.
 - **Native settings**, where the TV ships a settings app of its own beside Android's - Xiaomi China,
@@ -47,6 +48,8 @@ Click **Settings** for the TV's own settings. Hold OK on it for its menu:
   With `tile_menu` (on by default since 3.3), holding OK on a tile offers **Move**, which picks that app up straight away.
 - **Restart…** while `HomeKeyService` runs, which opens the system power menu (a launcher may not
   restart the TV itself).
+
+Weberin includes an optional weather panel. It queries Open-Meteo for the city chosen on the TV (Saint Petersburg by default), without using the device location. The launcher needs internet access for this feature; turn the panel off in Display settings to stop weather requests. Data: Open-Meteo.com (CC BY 4.0; the public API is for non-commercial use).
 
 The launcher's own page has these rows, top to bottom:
 

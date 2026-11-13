@@ -183,4 +183,20 @@
     <string name="weberin_settings_sound">Звук</string>
     <string name="weberin_settings_themes">Темы</string>
     <string name="weberin_settings_other">Другое</string>
+    <string name="weberin_move_left">Переместить влево</string>
+    <string name="weberin_move_right">Переместить вправо</string>
+    <string name="weberin_weather_title">Погода</string>
+    <string name="weberin_weather_city">Город</string>
+    <string name="weberin_weather_default_city">Санкт-Петербург</string>
+    <string name="weberin_weather_invalid_city">Введите название города (2–80 символов)</string>
+    <string name="weberin_weather_loading">Загрузка…</string>
+    <string name="weberin_weather_unavailable">Погода недоступна</string>
+    <string name="weberin_weather_humidity">Влажность %1$d%%</string>
+    <string name="weberin_weather_range">Мин. %1$d°   Макс. %2$d°</string>
+    <string name="weberin_weather_clear">Ясно</string>
+    <string name="weberin_weather_cloudy">Облачно</string>
+    <string name="weberin_weather_fog">Туман</string>
+    <string name="weberin_weather_rain">Дождь</string>
+    <string name="weberin_weather_snow">Снег</string>
+    <string name="weberin_weather_storm">Гроза</string>
 </resources>

@@ -180,4 +180,20 @@
     <string name="weberin_settings_sound">צליל</string>
     <string name="weberin_settings_themes">ערכות נושא</string>
     <string name="weberin_settings_other">אחר</string>
+    <string name="weberin_move_left">הזז שמאלה</string>
+    <string name="weberin_move_right">הזז ימינה</string>
+    <string name="weberin_weather_title">מזג אוויר</string>
+    <string name="weberin_weather_city">עיר</string>
+    <string name="weberin_weather_default_city">Saint Petersburg</string>
+    <string name="weberin_weather_invalid_city">הזן שם עיר (2–80 תווים)</string>
+    <string name="weberin_weather_loading">טוען…</string>
+    <string name="weberin_weather_unavailable">מזג האוויר אינו זמין</string>
+    <string name="weberin_weather_humidity">לחות %1$d%%</string>
+    <string name="weberin_weather_range">מינ׳ %1$d°   מקס׳ %2$d°</string>
+    <string name="weberin_weather_clear">בהיר</string>
+    <string name="weberin_weather_cloudy">מעונן</string>
+    <string name="weberin_weather_fog">ערפל</string>
+    <string name="weberin_weather_rain">גשם</string>
+    <string name="weberin_weather_snow">שלג</string>
+    <string name="weberin_weather_storm">סופת רעמים</string>
 </resources>

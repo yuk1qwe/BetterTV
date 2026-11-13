@@ -3719,6 +3719,10 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         View panel = getLayoutInflater().inflate(R.layout.popup_inputs, root, false);
         LinearLayout rows = panel.findViewById(R.id.rows);
         PopupWindow popup = glassPopup(panel, (int) (200 * density));
+        addSettingsMenuRow(rows, popup, R.string.layout_weberin, () -> {
+            getSharedPreferences(Config.SETTINGS_NAME, MODE_PRIVATE).edit().putBoolean("weberin_layout", true).apply();
+            startActivity(new Intent(this, WeberinActivity.class));
+        });
         if (!launcherSettingsButton) addSettingsMenuRow(rows, popup, R.string.launcher_settings, () -> startActivityForResult(
                 new Intent(this, LauncherSettingsActivity.class), LAUNCHER_SETTINGS_REQUEST));
         // Firmware that ships its own settings app next to the AOSP one (Xiaomi China is one): the
