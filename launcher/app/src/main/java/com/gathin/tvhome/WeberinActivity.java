@@ -118,7 +118,7 @@ public final class WeberinActivity extends Activity {
         if (wallpaper == null && !config.wallpapers.isEmpty()) wallpaper = config.wallpapers.get(0);
         if (wallpaper != null) {
             ImageView background = new ImageView(this);
-            background.setImageURI(android.net.Uri.fromFile(wallpaper));
+            background.setImageBitmap(loadWallpaper(wallpaper));
             background.setScaleType(ImageView.ScaleType.CENTER_CROP);
             root.addView(background, new FrameLayout.LayoutParams(-1, -1));
         }
@@ -192,6 +192,25 @@ public final class WeberinActivity extends Activity {
             if (apps.isEmpty()) grid.addView(label(getString(R.string.weberin_no_apps), 18, Color.WHITE));
             scroll.addView(grid);
             content.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1));
+        }
+    }
+
+    /** Decode only the chosen image, sampling it to the display rather than always allocating a 4K bitmap. */
+    private android.graphics.Bitmap loadWallpaper(java.io.File file) {
+        try {
+            android.graphics.BitmapFactory.Options options = new android.graphics.BitmapFactory.Options();
+            options.inJustDecodeBounds = true;
+            android.graphics.BitmapFactory.decodeFile(file.getPath(), options);
+            if (options.outWidth <= 0 || options.outHeight <= 0) return null;
+            android.util.DisplayMetrics metrics = getResources().getDisplayMetrics();
+            options.inSampleSize = WallpaperSize.sampleSize(options.outWidth, options.outHeight,
+                    metrics.widthPixels, metrics.heightPixels);
+            if (!WallpaperSize.accepted(options.outWidth / options.inSampleSize,
+                    options.outHeight / options.inSampleSize)) return null;
+            options.inJustDecodeBounds = false;
+            return android.graphics.BitmapFactory.decodeFile(file.getPath(), options);
+        } catch (Exception | OutOfMemoryError failure) {
+            return null;
         }
     }
 
