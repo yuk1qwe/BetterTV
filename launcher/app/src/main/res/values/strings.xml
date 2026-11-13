@@ -178,4 +178,12 @@
     <string name="weberin_clock">Weberin clock</string>
     <string name="weberin_favorites">Weberin home apps</string>
     <string name="weberin_wallpaper">Weberin wallpaper</string>
+    <string name="weberin_hold_hint">Hold OK to customize</string>
+    <string name="weberin_all_short">All</string>
+    <string name="weberin_settings_apps">Apps</string>
+    <string name="weberin_settings_system">System</string>
+    <string name="weberin_settings_display">Display</string>
+    <string name="weberin_settings_sound">Sound</string>
+    <string name="weberin_settings_themes">Themes</string>
+    <string name="weberin_settings_other">Other</string>
 </resources>

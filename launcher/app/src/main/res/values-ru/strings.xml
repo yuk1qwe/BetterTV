@@ -175,4 +175,12 @@
     <string name="weberin_clock">Часы Weberin</string>
     <string name="weberin_favorites">Приложения на главной Weberin</string>
     <string name="weberin_wallpaper">Обои Weberin</string>
+    <string name="weberin_hold_hint">Удерживайте OK для настройки</string>
+    <string name="weberin_all_short">Все</string>
+    <string name="weberin_settings_apps">Приложения</string>
+    <string name="weberin_settings_system">Система</string>
+    <string name="weberin_settings_display">Экран</string>
+    <string name="weberin_settings_sound">Звук</string>
+    <string name="weberin_settings_themes">Темы</string>
+    <string name="weberin_settings_other">Другое</string>
 </resources>

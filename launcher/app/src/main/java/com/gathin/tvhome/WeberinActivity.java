@@ -43,6 +43,7 @@ public final class WeberinActivity extends Activity {
     private String cachedWallpaperKey;
     private boolean focusSelectedTab;
     private boolean initialFocus = true;
+    private FrameLayout settingsOverlay;
 
     @Override protected void onCreate(Bundle state) {
         super.onCreate(state);
@@ -113,6 +114,7 @@ public final class WeberinActivity extends Activity {
     }
 
     private void render() {
+        settingsOverlay = null;
         FrameLayout root = new FrameLayout(this);
         root.setBackgroundColor(Color.BLACK);
         Config config = Config.load(this);
@@ -139,7 +141,10 @@ public final class WeberinActivity extends Activity {
         screen.setPadding(dp(40), dp(24), dp(40), dp(24));
         root.addView(screen, new FrameLayout.LayoutParams(-1, -1));
         FrameLayout header = new FrameLayout(this);
-        TextView brand = label("Weberinᵀⱽ", 21, Color.WHITE);
+        TextView brand = label("WeberinTV", 21, Color.WHITE);
+        android.text.SpannableString brandText = new android.text.SpannableString("WeberinTV");
+        brandText.setSpan(new android.text.style.RelativeSizeSpan(0.48f), 7, 9, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        brand.setText(brandText);
         brand.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
         header.addView(brand, new FrameLayout.LayoutParams(-2, dp(48), Gravity.START | Gravity.CENTER_VERTICAL));
         LinearLayout tabs = new LinearLayout(this);
@@ -166,8 +171,15 @@ public final class WeberinActivity extends Activity {
         header.addView(tabs, new FrameLayout.LayoutParams(-2, dp(46), Gravity.CENTER));
         LinearLayout status = new LinearLayout(this);
         status.setGravity(Gravity.CENTER_VERTICAL);
-        TextView settings = button("⚙", () -> startActivity(new Intent(this, LauncherSettingsActivity.class)));
-        status.addView(settings, new LinearLayout.LayoutParams(dp(46), dp(44)));
+        ImageView settings = new ImageView(this);
+        settings.setImageResource(R.drawable.ic_settings);
+        settings.setScaleType(ImageView.ScaleType.CENTER);
+        settings.setFocusable(true);
+        settings.setContentDescription(getString(R.string.tv_settings));
+        settings.setOnClickListener(v -> showSettings(root));
+        settings.setOnFocusChangeListener((v, focused) -> settings.setBackground(
+                focused ? shape(0x552f3035, 0xffeeeeee, 10) : null));
+        status.addView(settings, new LinearLayout.LayoutParams(dp(40), dp(44)));
         if (preferences.getBoolean("weberin_show_clock", true)) {
             LinearLayout clockBlock = new LinearLayout(this);
             clockBlock.setPadding(dp(14), 0, 0, 0);
@@ -205,19 +217,21 @@ public final class WeberinActivity extends Activity {
             panel.setOrientation(LinearLayout.VERTICAL);
             panel.setPadding(dp(16), dp(8), dp(16), dp(8));
             panel.setBackground(shape(0x99000000, 0x665f626b, 20));
+            LinearLayout titleRow = new LinearLayout(this);
+            titleRow.setGravity(Gravity.CENTER_VERTICAL);
             TextView title = label(getString(R.string.weberin_my_apps), 19, Color.WHITE);
             title.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
-            panel.addView(title, new LinearLayout.LayoutParams(-1, dp(38)));
+            titleRow.addView(title, new LinearLayout.LayoutParams(0, dp(38), 1));
+            TextView hint = label(getString(R.string.weberin_hold_hint), 11, 0xffb1b8c7);
+            titleRow.addView(hint);
+            panel.addView(titleRow);
             HorizontalScrollView scroll = new HorizontalScrollView(this);
             scroll.setHorizontalScrollBarEnabled(false);
             scroll.setClipChildren(false);
             LinearLayout row = new LinearLayout(this);
             row.setClipChildren(false);
             for (ResolveInfo app : favorites()) row.addView(tile(app));
-            TextView all = button(getString(R.string.weberin_all_apps), () -> { page = 1; focusedPackage = null; focusSelectedTab = true; render(); });
-            LinearLayout.LayoutParams allParams = new LinearLayout.LayoutParams(dp(150), dp(88));
-            allParams.setMargins(dp(4), dp(6), dp(4), dp(28));
-            row.addView(all, allParams);
+            row.addView(allAppsTile());
             if (initialFocus && row.getChildCount() > 0) {
                 initialFocus = false;
                 View first = row.getChildAt(0);
@@ -313,10 +327,166 @@ public final class WeberinActivity extends Activity {
         return result;
     }
 
-    private View tile(ResolveInfo app) {
-        String name = app.loadLabel(getPackageManager()).toString();
+    @Override public void onBackPressed() {
+        if (settingsOverlay != null) {
+            settingsOverlay = null;
+            render();
+        } else {
+            super.onBackPressed();
+        }
+    }
+
+    private void showSettings(FrameLayout root) {
+        FrameLayout overlay = new FrameLayout(this);
+        settingsOverlay = overlay;
+        overlay.setBackgroundColor(0x99000000);
+        overlay.setFocusable(true);
+        overlay.setOnKeyListener((v, key, event) -> {
+            if (key == android.view.KeyEvent.KEYCODE_BACK && event.getAction() == android.view.KeyEvent.ACTION_UP) {
+                settingsOverlay = null;
+                render();
+                return true;
+            }
+            return false;
+        });
+        root.addView(overlay, new FrameLayout.LayoutParams(-1, -1));
+        LinearLayout sidebar = new LinearLayout(this);
+        sidebar.setOrientation(LinearLayout.VERTICAL);
+        sidebar.setPadding(dp(12), dp(20), dp(12), dp(16));
+        sidebar.setBackground(shape(0xf509090a, 0xff777777, 20));
+        FrameLayout.LayoutParams sideParams = new FrameLayout.LayoutParams(dp(165), -1, Gravity.END);
+        sideParams.setMargins(0, dp(18), dp(18), dp(18));
+        overlay.addView(sidebar, sideParams);
+        TextClock time = new TextClock(this);
+        time.setFormat24Hour("HH:mm"); time.setFormat12Hour("h:mm a");
+        time.setTextColor(Color.WHITE); time.setTextSize(22);
+        time.setGravity(Gravity.CENTER);
+        sidebar.addView(time, new LinearLayout.LayoutParams(-1, dp(54)));
+        LinearLayout details = new LinearLayout(this);
+        details.setOrientation(LinearLayout.VERTICAL);
+        details.setPadding(dp(20), dp(18), dp(20), dp(18));
+        details.setBackground(shape(0xf509090a, 0xff777777, 20));
+        FrameLayout.LayoutParams detailParams = new FrameLayout.LayoutParams(dp(330), -1, Gravity.END);
+        detailParams.setMargins(0, dp(18), dp(200), dp(18));
+        overlay.addView(details, detailParams);
+        int[] categories = {R.string.weberin_settings_apps, R.string.weberin_settings_system,
+                R.string.weberin_settings_display, R.string.weberin_settings_sound,
+                R.string.weberin_settings_themes, R.string.weberin_settings_other};
+        for (int i = 0; i < categories.length; i++) {
+            final int category = i;
+            TextView item = label(getString(categories[i]), 16, Color.WHITE);
+            item.setGravity(Gravity.CENTER);
+            item.setFocusable(true);
+            item.setBackground(shape(0x00111111, 0, 9));
+            item.setOnFocusChangeListener((v, focused) -> {
+                item.setBackground(shape(0x00111111, focused ? Color.WHITE : 0, 9));
+                if (focused) fillSettings(details, category);
+            });
+            item.setOnClickListener(v -> fillSettings(details, category));
+            sidebar.addView(item, new LinearLayout.LayoutParams(-1, dp(42)));
+            if (i == 0) item.post(item::requestFocus);
+        }
+        fillSettings(details, 0);
+    }
+
+    private void fillSettings(LinearLayout details, int category) {
+        details.removeAllViews();
+        int[] categories = {R.string.weberin_settings_apps, R.string.weberin_settings_system,
+                R.string.weberin_settings_display, R.string.weberin_settings_sound,
+                R.string.weberin_settings_themes, R.string.weberin_settings_other};
+        TextView title = label(getString(categories[category]), 22, Color.WHITE);
+        title.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        details.addView(title, new LinearLayout.LayoutParams(-1, dp(50)));
+        ScrollView scroll = new ScrollView(this);
+        LinearLayout rows = new LinearLayout(this);
+        rows.setOrientation(LinearLayout.VERTICAL);
+        scroll.addView(rows);
+        details.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1));
+        if (category == 0) {
+            for (ResolveInfo app : apps) {
+                TextView row = button(app.loadLabel(getPackageManager()).toString() + "  ›", () -> {
+                    Intent intent = new Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                            android.net.Uri.parse("package:" + app.activityInfo.packageName));
+                    openSettingsTarget(intent);
+                });
+                rows.addView(row, new LinearLayout.LayoutParams(-1, dp(48)));
+            }
+        } else if (category == 1) {
+            addSettingsRow(rows, R.string.tv_settings, new Intent(android.provider.Settings.ACTION_SETTINGS));
+            addSettingsRow(rows, R.string.home_settings, new Intent(this, HomeSettingsActivity.class));
+        } else if (category == 2) {
+            addToggleRow(rows, R.string.weberin_clock, "weberin_show_clock");
+            addToggleRow(rows, R.string.weberin_favorites, "weberin_show_favorites");
+            addSettingsRow(rows, R.string.weberin_settings_display, new Intent(android.provider.Settings.ACTION_DISPLAY_SETTINGS));
+            addSettingsRow(rows, R.string.launcher_settings, new Intent(this, LauncherSettingsActivity.class));
+        } else if (category == 3) {
+            addSettingsRow(rows, R.string.weberin_settings_sound, new Intent(android.provider.Settings.ACTION_SOUND_SETTINGS));
+        } else {
+            if (category == 4) {
+                TextView wallpaper = button(getString(R.string.weberin_wallpaper) + "  ›", this::showBundledWallpaperPicker);
+                rows.addView(wallpaper, new LinearLayout.LayoutParams(-1, dp(48)));
+                TextView original = button(getString(R.string.layout_original) + "  ›", () -> {
+                    preferences.edit().putBoolean("weberin_layout", false).apply();
+                    finish();
+                });
+                rows.addView(original, new LinearLayout.LayoutParams(-1, dp(48)));
+            }
+            addSettingsRow(rows, R.string.launcher_settings, new Intent(this, LauncherSettingsActivity.class));
+            if (category == 5) addSettingsRow(rows, R.string.tv_settings, new Intent(android.provider.Settings.ACTION_SETTINGS));
+        }
+    }
+
+    private void addToggleRow(LinearLayout rows, int text, String key) {
+        TextView row = button("", () -> {});
+        Runnable refresh = () -> row.setText(getString(text) + ": " +
+                getString(preferences.getBoolean(key, true) ? R.string.on : R.string.off));
+        row.setOnClickListener(v -> {
+            preferences.edit().putBoolean(key, !preferences.getBoolean(key, true)).apply();
+            refresh.run();
+        });
+        refresh.run();
+        rows.addView(row, new LinearLayout.LayoutParams(-1, dp(48)));
+    }
+
+    private void showBundledWallpaperPicker() {
+        try {
+            String[] files = getAssets().list("weberin");
+            if (files == null) return;
+            List<String> pictures = new ArrayList<>();
+            pictures.add("theme"); pictures.add("none");
+            for (String file : files) if (file.endsWith(".jpg") || file.endsWith(".png")) pictures.add(file);
+            String[] names = pictures.toArray(new String[0]);
+            names[0] = getString(R.string.wallpaper_theme_default);
+            names[1] = getString(R.string.wallpaper_none);
+            int selected = pictures.indexOf(preferences.getString("weberin_wallpaper", "01-windows-black-1080p.png"));
+            new android.app.AlertDialog.Builder(this).setTitle(R.string.weberin_wallpaper)
+                    .setSingleChoiceItems(names, selected, (dialog, which) -> {
+                        preferences.edit().putString("weberin_wallpaper", pictures.get(which)).apply();
+                        dialog.dismiss();
+                        render();
+                    }).setNegativeButton(android.R.string.cancel, null).show();
+        } catch (java.io.IOException e) {
+            Toast.makeText(this, R.string.not_available, Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private void addSettingsRow(LinearLayout rows, int text, Intent intent) {
+        TextView row = button(getString(text) + "  ›", () -> openSettingsTarget(intent));
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, dp(48));
+        params.bottomMargin = dp(4);
+        rows.addView(row, params);
+    }
+
+    private void openSettingsTarget(Intent intent) {
+        try { startActivity(intent); }
+        catch (ActivityNotFoundException | SecurityException e) {
+            Toast.makeText(this, R.string.not_available, Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private View allAppsTile() {
         int screenDp = Math.round(getResources().getDisplayMetrics().widthPixels / getResources().getDisplayMetrics().density);
-        int tileWidth = Math.max(64, Math.min(160, (screenDp - 170) / 5));
+        int tileWidth = Math.max(64, (screenDp - 180) / 6);
         LinearLayout holder = new LinearLayout(this);
         holder.setOrientation(LinearLayout.VERTICAL);
         holder.setGravity(Gravity.CENTER_HORIZONTAL);
@@ -326,17 +496,49 @@ public final class WeberinActivity extends Activity {
         FrameLayout card = new FrameLayout(this);
         card.setFocusable(true);
         card.setBackground(shape(0xb31a1a1c, 0x66484a50, 12));
-        holder.addView(card, new LinearLayout.LayoutParams(-1, dp(88)));
+        ImageView icon = new ImageView(this);
+        icon.setImageResource(R.drawable.ic_apps);
+        icon.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        card.addView(icon, new FrameLayout.LayoutParams(dp(32), dp(32), Gravity.CENTER));
+        holder.addView(card, new LinearLayout.LayoutParams(-1, dp(Math.round(tileWidth * 0.57f))));
+        TextView caption = label(getString(R.string.weberin_all_short), 13, 0xffbfc6d3);
+        caption.setGravity(Gravity.CENTER);
+        holder.addView(caption, new LinearLayout.LayoutParams(-1, dp(26)));
+        card.setOnFocusChangeListener((v, focused) -> {
+            card.setBackground(shape(focused ? 0xff303135 : 0xb31a1a1c, focused ? Color.WHITE : 0x66484a50, 12));
+            caption.setTextColor(focused ? Color.WHITE : 0xffbfc6d3);
+        });
+        card.setOnClickListener(v -> { page = 1; focusedPackage = null; focusSelectedTab = true; render(); });
+        return holder;
+    }
+
+    private View tile(ResolveInfo app) {
+        String name = app.loadLabel(getPackageManager()).toString();
+        int screenDp = Math.round(getResources().getDisplayMetrics().widthPixels / getResources().getDisplayMetrics().density);
+        int tileWidth = Math.max(64, (screenDp - 180) / 6);
+        LinearLayout holder = new LinearLayout(this);
+        holder.setOrientation(LinearLayout.VERTICAL);
+        holder.setGravity(Gravity.CENTER_HORIZONTAL);
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(dp(tileWidth), -2);
+        params.setMargins(dp(4), dp(5), dp(8), dp(6));
+        holder.setLayoutParams(params);
+        FrameLayout card = new FrameLayout(this);
+        card.setFocusable(true);
+        card.setBackground(shape(0xb31a1a1c, 0x66484a50, 12));
+        card.setClipToOutline(true);
+        holder.addView(card, new LinearLayout.LayoutParams(-1, dp(Math.round(tileWidth * 0.57f))));
         android.graphics.drawable.Drawable banner = app.activityInfo.loadBanner(getPackageManager());
         ImageView art = new ImageView(this);
         if (banner != null) {
             art.setImageDrawable(banner);
-            art.setScaleType(ImageView.ScaleType.FIT_CENTER);
+            art.setScaleType(ImageView.ScaleType.FIT_XY);
             card.addView(art, new FrameLayout.LayoutParams(-1, -1, Gravity.CENTER));
         } else {
-            art.setImageDrawable(app.loadIcon(getPackageManager()));
-            art.setScaleType(ImageView.ScaleType.FIT_CENTER);
-            card.addView(art, new FrameLayout.LayoutParams(dp(46), dp(46), Gravity.CENTER));
+            TextView appName = label(name, 17, Color.WHITE);
+            appName.setGravity(Gravity.CENTER);
+            appName.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+            appName.setPadding(dp(6), 0, dp(6), 0);
+            card.addView(appName, new FrameLayout.LayoutParams(-1, -1));
         }
         TextView caption = label(name, 13, 0xffbfc6d3);
         caption.setGravity(Gravity.CENTER);
@@ -363,6 +565,7 @@ public final class WeberinActivity extends Activity {
         });
         card.setOnFocusChangeListener((v, focused) -> {
             card.setBackground(shape(focused ? 0xe51a1a1c : 0xb31a1a1c, focused ? Color.WHITE : 0x66484a50, 12));
+            card.setForeground(shape(Color.TRANSPARENT, focused ? Color.WHITE : 0, 12));
             card.setScaleX(focused ? 1.03f : 1f);
             card.setScaleY(focused ? 1.03f : 1f);
             caption.setTextColor(focused ? Color.WHITE : 0xffbfc6d3);

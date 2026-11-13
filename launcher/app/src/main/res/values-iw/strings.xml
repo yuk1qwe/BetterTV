@@ -172,4 +172,12 @@
     <string name="weberin_clock">שעון Weberin</string>
     <string name="weberin_favorites">יישומים בבית Weberin</string>
     <string name="weberin_wallpaper">רקע Weberin</string>
+    <string name="weberin_hold_hint">החזק OK להתאמה</string>
+    <string name="weberin_all_short">הכול</string>
+    <string name="weberin_settings_apps">יישומים</string>
+    <string name="weberin_settings_system">מערכת</string>
+    <string name="weberin_settings_display">תצוגה</string>
+    <string name="weberin_settings_sound">צליל</string>
+    <string name="weberin_settings_themes">ערכות נושא</string>
+    <string name="weberin_settings_other">אחר</string>
 </resources>
