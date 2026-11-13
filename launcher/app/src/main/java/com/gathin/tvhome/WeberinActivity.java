@@ -114,9 +114,11 @@ public final class WeberinActivity extends Activity {
         FrameLayout root = new FrameLayout(this);
         root.setBackgroundColor(Color.BLACK);
         Config config = Config.load(this);
-        if (config.wallpaper != null) {
+        java.io.File wallpaper = config.wallpaper;
+        if (wallpaper == null && !config.wallpapers.isEmpty()) wallpaper = config.wallpapers.get(0);
+        if (wallpaper != null) {
             ImageView background = new ImageView(this);
-            background.setImageURI(android.net.Uri.fromFile(config.wallpaper));
+            background.setImageURI(android.net.Uri.fromFile(wallpaper));
             background.setScaleType(ImageView.ScaleType.CENTER_CROP);
             root.addView(background, new FrameLayout.LayoutParams(-1, -1));
         }
