@@ -37,6 +37,8 @@ public final class WeberinActivity extends Activity {
     private LinearLayout content;
     private final List<ResolveInfo> apps = new ArrayList<>();
     private int page;
+    private String focusedPackage;
+    private boolean restoringFocus;
 
     @Override protected void onCreate(Bundle state) {
         super.onCreate(state);
@@ -130,7 +132,7 @@ public final class WeberinActivity extends Activity {
         int[] labels = {R.string.weberin_home, R.string.weberin_apps, R.string.weberin_channels};
         for (int i = 0; i < labels.length; i++) {
             final int target = i;
-            TextView tab = button(getString(labels[i]), () -> { page = target; render(); });
+            TextView tab = button(getString(labels[i]), () -> { page = target; focusedPackage = null; render(); });
             if (i == page) tab.setBackground(shape(0xff444444, 0xffaaaaaa, 14));
             header.addView(tab, new LinearLayout.LayoutParams(-2, dp(46)));
         }
@@ -143,7 +145,18 @@ public final class WeberinActivity extends Activity {
         clock.setFormat12Hour("h:mm a");
         clock.setTextColor(Color.WHITE);
         clock.setTextSize(22);
-        if (preferences.getBoolean("weberin_show_clock", true)) header.addView(clock);
+        if (preferences.getBoolean("weberin_show_clock", true)) {
+            LinearLayout clockBlock = new LinearLayout(this);
+            clockBlock.setOrientation(LinearLayout.VERTICAL);
+            clockBlock.addView(clock);
+            TextClock date = new TextClock(this);
+            date.setFormat12Hour("EEE, d MMMM");
+            date.setFormat24Hour("EEE, d MMMM");
+            date.setTextColor(0xffaeb6c5);
+            date.setTextSize(11);
+            clockBlock.addView(date);
+            header.addView(clockBlock);
+        }
         screen.addView(header);
         content = new LinearLayout(this);
         content.setOrientation(LinearLayout.VERTICAL);
@@ -228,6 +241,15 @@ public final class WeberinActivity extends Activity {
             if (page == 0) render();
             return true;
         });
+        tile.setOnFocusChangeListener((v, focused) -> {
+            tile.setTextColor(focused ? Color.BLACK : Color.WHITE);
+            tile.setBackground(shape(focused ? Color.WHITE : 0xff101010,
+                    focused ? Color.WHITE : 0xff353535, 14));
+            if (focused && !restoringFocus) focusedPackage = app.activityInfo.packageName;
+        });
+        if (app.activityInfo.packageName.equals(focusedPackage)) {
+            tile.post(() -> { restoringFocus = true; tile.requestFocus(); restoringFocus = false; });
+        }
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(dp(160), dp(100));
         params.setMargins(0, dp(8), dp(12), dp(8));
         tile.setLayoutParams(params);
