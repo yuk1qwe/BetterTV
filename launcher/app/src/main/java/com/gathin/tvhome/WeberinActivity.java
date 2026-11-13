@@ -39,6 +39,9 @@ public final class WeberinActivity extends Activity {
     private int page;
     private String focusedPackage;
     private boolean restoringFocus;
+    private android.graphics.Bitmap cachedWallpaper;
+    private String cachedWallpaperKey;
+    private boolean focusSelectedTab;
 
     @Override protected void onCreate(Bundle state) {
         super.onCreate(state);
@@ -46,8 +49,6 @@ public final class WeberinActivity extends Activity {
         page = state == null ? 0 : state.getInt("page", 0);
         getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_FULLSCREEN
                 | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY);
-        loadApps();
-        render();
     }
 
     @Override protected void onResume() {
@@ -117,8 +118,15 @@ public final class WeberinActivity extends Activity {
         java.io.File wallpaper = config.wallpaper;
         if (wallpaper == null && !config.wallpapers.isEmpty()) wallpaper = config.wallpapers.get(0);
         String selected = preferences.getString("weberin_wallpaper", "01-windows-black-1080p.png");
-        android.graphics.Bitmap bitmap = "theme".equals(selected) && wallpaper != null ? loadWallpaper(wallpaper)
-                : "none".equals(selected) || "theme".equals(selected) ? null : loadBundledWallpaper(selected);
+        String wallpaperKey = "theme".equals(selected) && wallpaper != null
+                ? "file:" + wallpaper.getAbsolutePath() + ":" + wallpaper.lastModified() + ":" + wallpaper.length()
+                : selected;
+        if (!wallpaperKey.equals(cachedWallpaperKey)) {
+            cachedWallpaper = "theme".equals(selected) && wallpaper != null ? loadWallpaper(wallpaper)
+                    : "none".equals(selected) || "theme".equals(selected) ? null : loadBundledWallpaper(selected);
+            cachedWallpaperKey = wallpaperKey;
+        }
+        android.graphics.Bitmap bitmap = cachedWallpaper;
         if (bitmap != null) {
             ImageView background = new ImageView(this);
             background.setImageBitmap(bitmap);
@@ -137,7 +145,8 @@ public final class WeberinActivity extends Activity {
         int[] labels = {R.string.weberin_home, R.string.weberin_apps, R.string.weberin_channels};
         for (int i = 0; i < labels.length; i++) {
             final int target = i;
-            TextView tab = button(getString(labels[i]), () -> { page = target; focusedPackage = null; render(); });
+            TextView tab = button(getString(labels[i]), () -> { page = target; focusedPackage = null; focusSelectedTab = true; render(); });
+            if (i == page && focusSelectedTab) { tab.post(tab::requestFocus); focusSelectedTab = false; }
             if (i == page) tab.setBackground(shape(0xff444444, 0xffaaaaaa, 14));
             header.addView(tab, new LinearLayout.LayoutParams(-2, dp(46)));
         }
@@ -182,7 +191,7 @@ public final class WeberinActivity extends Activity {
             LinearLayout row = new LinearLayout(this);
             List<ResolveInfo> favorites = favorites();
             for (ResolveInfo app : favorites) row.addView(tile(app));
-            TextView all = button(getString(R.string.weberin_all_apps), () -> { page = 1; render(); });
+            TextView all = button(getString(R.string.weberin_all_apps), () -> { page = 1; focusedPackage = null; focusSelectedTab = true; render(); });
             row.addView(all, new LinearLayout.LayoutParams(dp(160), dp(100)));
             scroll.addView(row);
             content.addView(scroll);
@@ -295,7 +304,10 @@ public final class WeberinActivity extends Activity {
         if (app.activityInfo.packageName.equals(focusedPackage)) {
             tile.post(() -> { restoringFocus = true; tile.requestFocus(); restoringFocus = false; });
         }
-        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(dp(160), dp(100));
+        int screenDp = Math.round(getResources().getDisplayMetrics().widthPixels
+                / getResources().getDisplayMetrics().density);
+        int tileWidth = Math.max(64, Math.min(160, (screenDp - 140) / 5));
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(dp(tileWidth), dp(100));
         params.setMargins(0, dp(8), dp(12), dp(8));
         tile.setLayoutParams(params);
         return tile;
