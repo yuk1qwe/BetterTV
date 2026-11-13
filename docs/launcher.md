@@ -50,6 +50,7 @@ Click **Settings** for the TV's own settings. Hold OK on it for its menu:
 
 The launcher's own page has these rows, top to bottom:
 
+- **Weberin wallpaper** selects a bundled image at 1080p or 4K, the active theme, or no image.
 - **Layout** switches between the original home and the experimental Weberin TV home. Hold OK on an
   app in Weberin to add or remove it from Home. **Weberin clock** and **Weberin home apps** control
   those parts of the alternate layout independently.

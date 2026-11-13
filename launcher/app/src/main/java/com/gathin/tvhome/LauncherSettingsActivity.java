@@ -43,6 +43,7 @@ public final class LauncherSettingsActivity extends Activity {
     private TextView weberinClockChoice;
     private TextView weberinFavoritesChoice;
     private TextView wallpaperChoice;
+    private TextView weberinWallpaperChoice;
     private TextView animationsChoice;
     private TextView advancedChoice;
     private TextView followThemeChoice;
@@ -66,7 +67,7 @@ public final class LauncherSettingsActivity extends Activity {
         weberinFavoritesChoice.setOnClickListener(v -> toggleWeberin("weberin_show_favorites"));
         layoutChoice = findViewById(R.id.layoutChoice);
         layoutChoice.setOnClickListener(v -> {
-            choices.edit().putBoolean("weberin_layout", !choices.getBoolean("weberin_layout", false)).apply();
+            choices.edit().putBoolean("weberin_layout", !choices.getBoolean("weberin_layout", true)).apply();
             changed();
             refresh();
         });
@@ -154,6 +155,8 @@ public final class LauncherSettingsActivity extends Activity {
                 refresh();
             });
         }
+        weberinWallpaperChoice = findViewById(R.id.weberinWallpaperChoice);
+        weberinWallpaperChoice.setOnClickListener(v -> showWeberinWallpaperPicker());
         wallpaperChoice = findViewById(R.id.wallpaperChoice);
         wallpaperChoice.setOnClickListener(v -> showWallpaperPicker());
         animationsChoice = findViewById(R.id.animationsChoice);
@@ -217,6 +220,29 @@ public final class LauncherSettingsActivity extends Activity {
         LinearLayout row = (LinearLayout) views[0].getParent();
         row.removeAllViews();
         for (int i = views.length - 1; i >= 0; i--) row.addView(views[i]);
+    }
+
+    private void showWeberinWallpaperPicker() {
+        String[] files;
+        try { files = getAssets().list("weberin"); }
+        catch (java.io.IOException e) { return; }
+        if (files == null) return;
+        java.util.List<String> pictures = new java.util.ArrayList<>();
+        pictures.add("theme");
+        pictures.add("none");
+        for (String file : files) if (file.endsWith(".jpg") || file.endsWith(".png")) pictures.add(file);
+        String[] labels = new String[pictures.size()];
+        labels[0] = getString(R.string.wallpaper_theme_default);
+        labels[1] = getString(R.string.wallpaper_none);
+        for (int i = 2; i < pictures.size(); i++) labels[i] = pictures.get(i);
+        String current = choices.getString("weberin_wallpaper", "01-windows-black-1080p.png");
+        new AlertDialog.Builder(this).setTitle(R.string.weberin_wallpaper)
+                .setSingleChoiceItems(labels, pictures.indexOf(current), (dialog, which) -> {
+                    choices.edit().putString("weberin_wallpaper", pictures.get(which)).apply();
+                    changed();
+                    refresh();
+                    dialog.dismiss();
+                }).setNegativeButton(android.R.string.cancel, null).show();
     }
 
     private void showWallpaperPicker() {
@@ -339,7 +365,7 @@ public final class LauncherSettingsActivity extends Activity {
                 getString(choices.getBoolean("weberin_show_clock", true) ? R.string.on : R.string.off)));
         weberinFavoritesChoice.setText(getString(R.string.visibility_state, getString(R.string.weberin_favorites),
                 getString(choices.getBoolean("weberin_show_favorites", true) ? R.string.on : R.string.off)));
-        layoutChoice.setText(getString(R.string.layout_state, getString(choices.getBoolean("weberin_layout", false)
+        layoutChoice.setText(getString(R.string.layout_state, getString(choices.getBoolean("weberin_layout", true)
                 ? R.string.layout_weberin : R.string.layout_original)));
         for (int i = 0; i < columnChoices.length; i++) {
             columnChoices[i].setSelected(columns == i + 4);
@@ -363,6 +389,10 @@ public final class LauncherSettingsActivity extends Activity {
                 getString(advancedEffects ? R.string.on : R.string.off)));
         advancedChoice.setEnabled(animations);
         advancedChoice.setAlpha(animations ? 1f : 0.5f);
+        String weberinWallpaper = choices.getString("weberin_wallpaper", "01-windows-black-1080p.png");
+        weberinWallpaperChoice.setText(getString(R.string.visibility_state, getString(R.string.weberin_wallpaper),
+                "theme".equals(weberinWallpaper) ? getString(R.string.wallpaper_theme_default)
+                        : "none".equals(weberinWallpaper) ? getString(R.string.wallpaper_none) : weberinWallpaper));
         String wallpaperCurrent = choices.getString(Config.WALLPAPER_CHOICE_KEY, null);
         wallpaperChoice.setText(getString(R.string.wallpaper_state,
                 "none".equals(wallpaperCurrent) ? getString(R.string.wallpaper_none)

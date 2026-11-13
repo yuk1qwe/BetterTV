@@ -52,7 +52,7 @@ public final class WeberinActivity extends Activity {
 
     @Override protected void onResume() {
         super.onResume();
-        if (preferences != null && !preferences.getBoolean("weberin_layout", false)) finish();
+        if (preferences != null && !preferences.getBoolean("weberin_layout", true)) finish();
         else if (preferences != null) { loadApps(); render(); }
     }
 
@@ -116,9 +116,12 @@ public final class WeberinActivity extends Activity {
         Config config = Config.load(this);
         java.io.File wallpaper = config.wallpaper;
         if (wallpaper == null && !config.wallpapers.isEmpty()) wallpaper = config.wallpapers.get(0);
-        if (wallpaper != null) {
+        String selected = preferences.getString("weberin_wallpaper", "01-windows-black-1080p.png");
+        android.graphics.Bitmap bitmap = "theme".equals(selected) && wallpaper != null ? loadWallpaper(wallpaper)
+                : "none".equals(selected) || "theme".equals(selected) ? null : loadBundledWallpaper(selected);
+        if (bitmap != null) {
             ImageView background = new ImageView(this);
-            background.setImageBitmap(loadWallpaper(wallpaper));
+            background.setImageBitmap(bitmap);
             background.setScaleType(ImageView.ScaleType.CENTER_CROP);
             root.addView(background, new FrameLayout.LayoutParams(-1, -1));
         }
@@ -193,6 +196,27 @@ public final class WeberinActivity extends Activity {
             scroll.addView(grid);
             content.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1));
         }
+    }
+
+    private android.graphics.Bitmap loadBundledWallpaper(String name) {
+        if (name.contains("/") || name.contains("..")) return null;
+        try {
+            android.graphics.BitmapFactory.Options options = new android.graphics.BitmapFactory.Options();
+            options.inJustDecodeBounds = true;
+            try (java.io.InputStream input = getAssets().open("weberin/" + name)) {
+                android.graphics.BitmapFactory.decodeStream(input, null, options);
+            }
+            if (options.outWidth <= 0 || options.outHeight <= 0) return null;
+            android.util.DisplayMetrics metrics = getResources().getDisplayMetrics();
+            options.inSampleSize = WallpaperSize.sampleSize(options.outWidth, options.outHeight,
+                    metrics.widthPixels, metrics.heightPixels);
+            if (!WallpaperSize.accepted(options.outWidth / options.inSampleSize,
+                    options.outHeight / options.inSampleSize)) return null;
+            options.inJustDecodeBounds = false;
+            try (java.io.InputStream input = getAssets().open("weberin/" + name)) {
+                return android.graphics.BitmapFactory.decodeStream(input, null, options);
+            }
+        } catch (java.io.IOException | OutOfMemoryError failure) { return null; }
     }
 
     /** Decode only the chosen image, sampling it to the display rather than always allocating a 4K bitmap. */

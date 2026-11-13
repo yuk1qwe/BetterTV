@@ -1090,7 +1090,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     protected void onResume() {
         super.onResume();
         resumed = true;
-        if (getSharedPreferences(Config.SETTINGS_NAME, MODE_PRIVATE).getBoolean("weberin_layout", false)) {
+        if (getSharedPreferences(Config.SETTINGS_NAME, MODE_PRIVATE).getBoolean("weberin_layout", true)) {
             startActivity(new Intent(this, WeberinActivity.class));
             return;
         }
