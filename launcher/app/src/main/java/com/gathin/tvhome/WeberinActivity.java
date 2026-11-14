@@ -6,10 +6,8 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.ApplicationInfo;
-import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
 import android.graphics.Bitmap;
-import android.graphics.BitmapFactory;
 import android.graphics.Color;
 import android.graphics.drawable.Drawable;
 import android.net.ConnectivityManager;
@@ -30,9 +28,7 @@ import android.widget.ScrollView;
 import android.widget.TextClock;
 import android.widget.TextView;
 import android.widget.Toast;
-import java.io.File;
 import java.io.IOException;
-import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
@@ -45,7 +41,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /** Native alternate presentation; the original launcher and its settings remain available. */
-public final class WeberinActivity extends Activity implements WeberinSettings.Host, WeberinStartup.Host {
+public final class WeberinActivity extends Activity implements WeberinSettings.Host, WeberinStartup.Host, WeberinFavoritesEditor.Host {
     private static final String FAVORITES = "weberin_favorites", FAVORITE_ORDER = "weberin_favorites_order";
     private static final String DEFAULT_WALLPAPER = "01-windows-black-1080p.png";
     private SharedPreferences preferences;
@@ -53,12 +49,41 @@ public final class WeberinActivity extends Activity implements WeberinSettings.H
     private WeberinLaunch launch;
     private WeberinStartup startup;
     private FrameLayout scene, pageContent, weatherPanel, overlay;
+    private FrameLayout modalHost, favoritesOverlay;
+    private View settingsFocusBeforeEditor;
+    private boolean sceneNeedsRender;
     private WeberinSettings settingsPanel;
+    private WeberinFavoritesEditor favoritesEditor;
+    private WeberinCatalog.Snapshot snapshot;
+    private final ExecutorService catalogExecutor = Executors.newSingleThreadExecutor();
+    private final ExecutorService artworkExecutor = Executors.newSingleThreadExecutor();
+    private final android.util.LruCache<String, Drawable> icons = new android.util.LruCache<>(32);
+    private final Set<String> missingBanners = new HashSet<>();
+    private List<ResolveInfo> cachedFavorites, cachedOrdered;
+    private boolean loading, resumed, packagesDirty = true, refreshAgain, sharedPrepared, contentReported;
+    private int catalogGeneration;
+    private FrameLayout pagesHost;
+    private final PageState[] pages = new PageState[3];
+    private static final class PageState {
+        final FrameLayout view, weather;
+        final List<View> cards;
+        final View action, editor;
+        PageState(FrameLayout view, List<View> cards, FrameLayout weather, View action, View editor) {
+            this.view = view; this.cards = new ArrayList<>(cards); this.weather = weather; this.action = action; this.editor = editor;
+        }
+    }
+    private final android.content.BroadcastReceiver packages = new android.content.BroadcastReceiver() {
+        @Override public void onReceive(Context context, Intent intent) {
+            packagesDirty = true;
+            if (resumed) refreshCatalog();
+        }
+    };
     private final List<ResolveInfo> apps = new ArrayList<>();
     private final List<View> cards = new ArrayList<>();
     private final TextView[] tabs = new TextView[3];
     private ImageView settingsButton;
     private View homeAction;
+    private View dockEditorButton;
     private int page, focusedTab = -1;
     private String focusedPackage;
     private Bitmap wallpaper;
@@ -80,87 +105,126 @@ public final class WeberinActivity extends Activity implements WeberinSettings.H
         page = state == null ? 0 : Math.max(0, Math.min(2, state.getInt("page", 0)));
         focusedPackage = state == null ? null : state.getString("focused_package");
         startup = new WeberinStartup(this, this);
+        android.content.IntentFilter filter = new android.content.IntentFilter();
+        filter.addAction(Intent.ACTION_PACKAGE_ADDED); filter.addAction(Intent.ACTION_PACKAGE_REMOVED);
+        filter.addAction(Intent.ACTION_PACKAGE_CHANGED); filter.addAction(Intent.ACTION_PACKAGE_REPLACED);
+        filter.addDataScheme("package");
+        if (android.os.Build.VERSION.SDK_INT >= 33) registerReceiver(packages, filter, Context.RECEIVER_NOT_EXPORTED);
+        else registerReceiver(packages, filter);
         getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_FULLSCREEN
                 | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY);
     }
     @Override protected void onResume() {
         super.onResume();
+        resumed = true;
         if (!preferences.getBoolean("weberin_layout", true)) { finish(); return; }
-        config = Config.load(this); launch = new WeberinLaunch(this, config); loadApps();
-        if (settingsPanel == null) render(); else settingsPanel.refresh();
-        startup.resume(config);
+        WeberinDeviceControls.applyWindowBrightness(this, preferences);
+        if (settingsPanel != null && favoritesEditor == null) settingsPanel.refresh();
+        if (scene == null) {
+            FrameLayout loadingScreen = new FrameLayout(this); loadingScreen.setBackgroundColor(Color.BLACK);
+            TextView title = text("Weberin TV", 34, WeberinUi.WHITE, true); title.setGravity(Gravity.CENTER);
+            loadingScreen.addView(title, new FrameLayout.LayoutParams(-1, -1));
+            setContentView(loadingScreen);
+        }
+        refreshCatalog();
     }
-    @Override protected void onPause() { startup.pause(); super.onPause(); }
+    @Override protected void onPause() { resumed = false; startup.pause(); super.onPause(); }
     @Override protected void onSaveInstanceState(Bundle out) {
         out.putInt("page", page); out.putString("focused_package", focusedPackage); super.onSaveInstanceState(out);
     }
     private TextView text(CharSequence value, int size, int color, boolean bold) { return WeberinUi.text(this, value, size, color, bold); }
     private void put(FrameLayout parent, View view, int x, int y, int w, int h) { WeberinUi.put(parent, view, x, y, w, h); }
 
-    private void loadApps() {
-        Map<String, ResolveInfo> found = new LinkedHashMap<>(); PackageManager pm = getPackageManager();
-        for (String category : new String[]{Intent.CATEGORY_LEANBACK_LAUNCHER, Intent.CATEGORY_LAUNCHER}) {
-            for (ResolveInfo app : pm.queryIntentActivities(new Intent(Intent.ACTION_MAIN).addCategory(category), 0)) {
-                if (app.activityInfo == null || !app.activityInfo.exported || !app.activityInfo.enabled
-                        || app.activityInfo.packageName.equals(getPackageName())
-                        || config.libraryExcludedApps.contains(app.activityInfo.packageName)) continue;
-                found.putIfAbsent(app.activityInfo.packageName, app);
-            }
-        }
-        for (String pkg : config.libraryApps) {
-            Intent intent = pm.getLeanbackLaunchIntentForPackage(pkg);
-            if (intent == null) intent = pm.getLaunchIntentForPackage(pkg);
-            ResolveInfo app = intent == null ? null : pm.resolveActivity(intent, 0);
-            if (app != null && app.activityInfo != null && app.activityInfo.exported
-                    && !config.libraryExcludedApps.contains(pkg) && !pkg.equals(getPackageName())) found.putIfAbsent(pkg, app);
-        }
-        apps.clear(); apps.addAll(found.values());
-        java.text.Collator collator = java.text.Collator.getInstance();
-        Collections.sort(apps, (a, b) -> collator.compare(launch.label(a), launch.label(b)));
+    private void refreshCatalog() {
+        if (loading) { refreshAgain = true; return; }
+        loading = true;
+        final boolean reloadPackages = packagesDirty; packagesDirty = false;
+        final WeberinCatalog.Snapshot previous = snapshot;
+        catalogExecutor.execute(() -> {
+            WeberinCatalog.Snapshot loaded = null;
+            android.os.Trace.beginSection("Weberin.catalog");
+            try { loaded = WeberinCatalog.load(this, previous, reloadPackages); }
+            catch (RuntimeException | OutOfMemoryError failure) {
+                android.util.Log.w("WeberinCatalog", "Could not refresh launcher", failure);
+            } finally { android.os.Trace.endSection(); }
+            final WeberinCatalog.Snapshot result = loaded;
+            runOnUiThread(() -> {
+                loading = false;
+                if (isDestroyed() || isFinishing()) return;
+                if (result != null && result != snapshot) {
+                    if (previous != null && !previous.config.locale.equals(result.config.locale)) { recreate(); return; }
+                    snapshot = result; config = result.config; launch = result.launch;
+                    apps.clear(); apps.addAll(result.apps); cachedFavorites = null; cachedOrdered = null;
+                    wallpaper = result.wallpaper; wallpaperKey = result.wallpaperKey;
+                    catalogGeneration++; banners.clear(); missingBanners.clear();
+                    if (reloadPackages) icons.evictAll();
+                    invalidatePages();
+                    if (!sharedPrepared || previous == null || previous.config.handleViewInputs != config.handleViewInputs
+                            || previous.config.restoreKeyServices != config.restoreKeyServices) {
+                        MainActivity.prepareSharedFeatures(this, config); sharedPrepared = true;
+                    }
+                    sceneNeedsRender = true;
+                    if (resumed && settingsPanel == null && favoritesEditor == null) render();
+                    else if (resumed && settingsPanel != null && favoritesEditor == null) settingsPanel.refresh();
+                }
+                if (result == null) packagesDirty |= reloadPackages;
+                if (result == null && scene == null && resumed) {
+                    TextView retry = text(getString(R.string.not_available), 28, WeberinUi.WHITE, false);
+                    retry.setGravity(Gravity.CENTER); retry.setFocusableInTouchMode(true);
+                    retry.setOnClickListener(v -> refreshCatalog()); setContentView(retry); retry.requestFocus();
+                }
+                if (resumed && config != null) {
+                    if (sceneNeedsRender && settingsPanel == null && favoritesEditor == null) render();
+                    startup.resume(config);
+                    if (weatherPanel != null) { updateWeatherPanel(); requestWeatherIfNeeded(); }
+                }
+                if (refreshAgain) { refreshAgain = false; refreshCatalog(); }
+            });
+        });
     }
 
     private void render() {
         int tabToRestore = focusedTab;
+        if (snapshot != null) { wallpaper = snapshot.wallpaper; wallpaperKey = snapshot.wallpaperKey; }
+        sceneNeedsRender = false;
         settingsPanel = null; overlay = null; scene = new FrameLayout(this);
+        modalHost = new FrameLayout(this); put(modalHost, scene, 0, 0, 1920, 1080);
         scene.setClipChildren(false); scene.setBackgroundColor(Color.BLACK);
         scene.setFocusableInTouchMode(true); scene.requestFocus(); addWallpaper();
-        pageContent = new FrameLayout(this); pageContent.setClipChildren(false);
-        put(scene, pageContent, 0, 0, 1920, 1080); addHeader();
-        setContentView(new WeberinUi.Viewport(this, scene)); populatePage();
+        pagesHost = new FrameLayout(this); pagesHost.setClipChildren(false);
+        put(scene, pagesHost, 0, 0, 1920, 1080); addHeader();
+        setContentView(new WeberinUi.Viewport(this, modalHost)); populatePage();
+        if (!contentReported) {
+            final FrameLayout drawnScene = scene;
+            drawnScene.getViewTreeObserver().addOnDrawListener(new android.view.ViewTreeObserver.OnDrawListener() {
+                private boolean posted;
+                @Override public void onDraw() {
+                    if (posted || contentReported || !resumed) return;
+                    posted = true;
+                    // Removing an OnDrawListener during drawing is forbidden; report after this real
+                    // content frame, rather than treating the earlier loading screen as ready.
+                    drawnScene.post(() -> {
+                        boolean valid = !isDestroyed() && !isFinishing() && scene == drawnScene;
+                        if (valid && !resumed) { posted = false; return; }
+                        android.view.ViewTreeObserver observer = drawnScene.getViewTreeObserver();
+                        if (observer.isAlive()) observer.removeOnDrawListener(this);
+                        if (valid && !contentReported) { contentReported = true; reportFullyDrawn(); }
+                    });
+                }
+            });
+        }
         scene.post(() -> {
             if (tabToRestore >= 0) tabs[tabToRestore].requestFocus();
-            else if (!restoreCardFocus()) { if (!cards.isEmpty()) cards.get(0).requestFocus(); else tabs[page].requestFocus(); }
+            else if (!restoreCardFocus()) { if (!cards.isEmpty()) cards.get(0).requestFocus(); else if (homeAction != null) homeAction.requestFocus(); else tabs[page].requestFocus(); }
         });
     }
 
     private void addWallpaper() {
-        String selected = preferences.getString("weberin_wallpaper", DEFAULT_WALLPAPER);
-        File file = config.wallpaper;
-        if (file == null && !config.wallpapers.isEmpty()) file = config.wallpapers.get(0);
-        String key = "theme".equals(selected) && file != null ? file.getAbsolutePath() + ":" + file.lastModified() + ":" + file.length() : selected;
-        if (!key.equals(wallpaperKey)) { wallpaper = decodeWallpaper(selected, file); wallpaperKey = key; }
         if (wallpaper != null) {
             ImageView image = new ImageView(this); image.setImageBitmap(wallpaper); image.setScaleType(ImageView.ScaleType.CENTER_CROP);
             put(scene, image, 0, 0, 1920, 1080);
         }
     }
-    private Bitmap decodeWallpaper(String selected, File file) {
-        if (selected == null || "none".equals(selected) || "theme".equals(selected) && file == null) return null;
-        if (!"theme".equals(selected) && (selected.contains("/") || selected.contains(".."))) return null;
-        try {
-            BitmapFactory.Options options = new BitmapFactory.Options(); options.inJustDecodeBounds = true;
-            if ("theme".equals(selected)) BitmapFactory.decodeFile(file.getPath(), options);
-            else try (InputStream input = getAssets().open("weberin/" + selected)) { BitmapFactory.decodeStream(input, null, options); }
-            if (options.outWidth <= 0 || options.outHeight <= 0) return null;
-            android.util.DisplayMetrics metrics = getResources().getDisplayMetrics();
-            options.inSampleSize = WallpaperSize.sampleSize(options.outWidth, options.outHeight, metrics.widthPixels, metrics.heightPixels);
-            if (!WallpaperSize.accepted(options.outWidth / options.inSampleSize, options.outHeight / options.inSampleSize)) return null;
-            options.inJustDecodeBounds = false;
-            if ("theme".equals(selected)) return BitmapFactory.decodeFile(file.getPath(), options);
-            try (InputStream input = getAssets().open("weberin/" + selected)) { return BitmapFactory.decodeStream(input, null, options); }
-        } catch (IOException | RuntimeException | OutOfMemoryError ignored) { return null; }
-    }
-
     private void addHeader() {
         TextView brand = text("Weberin", 34, WeberinUi.WHITE, true);
         brand.setTypeface(WeberinUi.font(this, 700)); brand.setLetterSpacing(-.045f);
@@ -184,7 +248,7 @@ public final class WeberinActivity extends Activity implements WeberinSettings.H
                 if (key == KeyEvent.KEYCODE_DPAD_UP) return true;
                 if (key == KeyEvent.KEYCODE_DPAD_LEFT) { tabs[Math.max(0, target - 1)].requestFocus(); return true; }
                 if (key == KeyEvent.KEYCODE_DPAD_RIGHT) { if (target < 2) tabs[target + 1].requestFocus(); else settingsButton.requestFocus(); return true; }
-                if (key == KeyEvent.KEYCODE_DPAD_DOWN) { if (!restoreCardFocus() && !cards.isEmpty()) cards.get(0).requestFocus(); return true; }
+                if (key == KeyEvent.KEYCODE_DPAD_DOWN) { if (!restoreCardFocus()) { if (!cards.isEmpty()) cards.get(0).requestFocus(); else if (homeAction != null) homeAction.requestFocus(); } return true; }
                 return false;
             });
             tabs[i] = tab; put(capsule, tab, x[i], 9, widths[i], 52);
@@ -206,7 +270,7 @@ public final class WeberinActivity extends Activity implements WeberinSettings.H
         settingsButton.setOnKeyListener((v, key, event) -> {
             if (event.getAction() != KeyEvent.ACTION_DOWN) return false;
             if (key == KeyEvent.KEYCODE_DPAD_LEFT) { tabs[2].requestFocus(); return true; }
-            if (key == KeyEvent.KEYCODE_DPAD_DOWN) { if (!restoreCardFocus() && !cards.isEmpty()) cards.get(cards.size() - 1).requestFocus(); return true; }
+            if (key == KeyEvent.KEYCODE_DPAD_DOWN) { if (!restoreCardFocus()) { if (!cards.isEmpty()) cards.get(cards.size() - 1).requestFocus(); else if (homeAction != null) homeAction.requestFocus(); } return true; }
             return key == KeyEvent.KEYCODE_DPAD_UP || key == KeyEvent.KEYCODE_DPAD_RIGHT;
         });
         put(scene, settingsButton, 1616, 64, 48, 48);
@@ -244,7 +308,10 @@ public final class WeberinActivity extends Activity implements WeberinSettings.H
             return label;
         } catch (SecurityException ignored) { return "Wi-Fi"; }
     }
-    private void selectPage(int target) { if (page != target) { page = target; focusedPackage = null; populatePage(); } updateTabs(); }
+    private void selectPage(int target) {
+        if (page != target) { page = target; focusedPackage = null; showPage(); }
+        updateTabs();
+    }
     private void updateTabs() {
         for (int i = 0; i < tabs.length; i++) if (tabs[i] != null) {
             tabs[i].setTextColor(i == page ? 0xff202023 : 0xffdddddf);
@@ -253,7 +320,21 @@ public final class WeberinActivity extends Activity implements WeberinSettings.H
         }
     }
     private void populatePage() {
-        pageContent.removeAllViews(); cards.clear(); weatherPanel = null; homeAction = null;
+        invalidatePages(); pagesHost.removeAllViews(); showPage();
+    }
+    private void invalidatePages() { java.util.Arrays.fill(pages, null); }
+    private void showPage() {
+        for (int i = 0; i < pagesHost.getChildCount(); i++) pagesHost.getChildAt(i).setVisibility(View.GONE);
+        PageState saved = pages[page];
+        if (saved != null) {
+            pageContent = saved.view; cards.clear(); cards.addAll(saved.cards); weatherPanel = saved.weather; homeAction = saved.action; dockEditorButton = saved.editor;
+            pageContent.setVisibility(View.VISIBLE);
+            if (weatherPanel != null) { updateWeatherPanel(); requestWeatherIfNeeded(); }
+            return;
+        }
+        pageContent = new FrameLayout(this); pageContent.setClipChildren(false);
+        put(pagesHost, pageContent, 0, 0, 1920, 1080);
+        cards.clear(); weatherPanel = null; homeAction = null; dockEditorButton = null;
         if (page == 0) {
             if (preferences.getBoolean("weberin_home_full", false)) addFullHome();
             if (preferences.getBoolean("weberin_show_weather", preferences.getBoolean("weberin_home_full", false))) addWeatherPanel();
@@ -261,22 +342,35 @@ public final class WeberinActivity extends Activity implements WeberinSettings.H
         } else if (page == 1) addAppGrid();
         else { TextView empty = text(getString(R.string.weberin_channels_later), 28, WeberinUi.MUTED, false);
             empty.setGravity(Gravity.CENTER); put(pageContent, empty, 460, 440, 1000, 100); }
+        pages[page] = new PageState(pageContent, cards, weatherPanel, homeAction, dockEditorButton);
         updateTabs();
     }
     private int surfaceOpacity() { return preferences.contains(Config.DOCK_OPACITY_KEY) ? Math.max(0, Math.min(255, config.dockOpacity * 255 / 100)) : 20; }
+    private int cardScale() { return Math.max(90, Math.min(110, preferences.getInt("weberin_card_scale", 100))); }
     private void addDock() {
+        int width = 270 * cardScale() / 100, height = Math.round(width * 156f / 270), extra = height - 156, step = width + 20;
         FrameLayout panel = new FrameLayout(this); panel.setClipChildren(false);
         panel.setBackground(new WeberinUi.Surface(preferences.getBoolean("weberin_surface_tint", false), surfaceOpacity()));
-        put(pageContent, panel, 60, 716, 1784, 304);
-        put(panel, text(getString(R.string.weberin_my_apps), 26, WeberinUi.WHITE, true), 32, 28, 700, 36);
+        put(pageContent, panel, 60, 716 - extra, 1784, 304 + extra);
+        TextView edit = text(getString(R.string.weberin_my_apps), 26, WeberinUi.WHITE, true);
+        edit.setFocusableInTouchMode(true); edit.setOnClickListener(v -> onFavoritesEditor());
+        edit.setOnFocusChangeListener((v, focus) -> edit.setBackground(focus ? WeberinUi.round(0x331a1a1a, 0xffdce6eb, 8) : null));
+        edit.setOnKeyListener((v, key, event) -> {
+            if (event.getAction() != KeyEvent.ACTION_DOWN) return false;
+            if (key == KeyEvent.KEYCODE_DPAD_UP) { if (homeAction != null) homeAction.requestFocus(); else tabs[0].requestFocus(); return true; }
+            if (key == KeyEvent.KEYCODE_DPAD_DOWN) { if (!cards.isEmpty()) cards.get(0).requestFocus(); return true; }
+            if (key == KeyEvent.KEYCODE_DPAD_RIGHT) { settingsButton.requestFocus(); return true; }
+            return key == KeyEvent.KEYCODE_DPAD_LEFT;
+        });
+        dockEditorButton = edit; put(panel, edit, 32, 28, 700, 36);
         TextView hint = text(getString(R.string.weberin_hold_hint), 16, WeberinUi.MUTED, false); hint.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
         if (preferences.getBoolean("weberin_show_hints", true)) put(panel, hint, 1050, 30, 702, 30);
         HorizontalScrollView scroll = new HorizontalScrollView(this); scroll.setHorizontalScrollBarEnabled(false);
-        scroll.setClipChildren(false); scroll.setClipToPadding(false); put(panel, scroll, 24, 74, 1736, 214);
+        scroll.setClipChildren(false); scroll.setClipToPadding(false); put(panel, scroll, 24, 74, 1736, 214 + extra);
         FrameLayout row = new FrameLayout(this); row.setClipChildren(false); List<ResolveInfo> favorites = favorites();
-        scroll.addView(row, new ScrollView.LayoutParams(Math.max(1736, (favorites.size() + 1) * 290 - 4), 214));
-        for (int i = 0; i < favorites.size(); i++) put(row, tile(favorites.get(i), 270, 156), i * 290, 0, 286, 214);
-        put(row, allAppsTile(), favorites.size() * 290, 0, 286, 214); wireCards(0);
+        scroll.addView(row, new ScrollView.LayoutParams(Math.max(1736, (favorites.size() + 1) * step - 4), 214 + extra));
+        for (int i = 0; i < favorites.size(); i++) put(row, tile(favorites.get(i), width, height), i * step, 0, width + 16, height + 58);
+        put(row, allAppsTile(width, height), favorites.size() * step, 0, width + 16, height + 58); wireCards(0);
     }
     private void addAppGrid() {
         put(pageContent, text(getString(R.string.weberin_apps), 26, WeberinUi.WHITE, true), 96, 197, 800, 38);
@@ -285,12 +379,13 @@ public final class WeberinActivity extends Activity implements WeberinSettings.H
         ScrollView scroll = new ScrollView(this); scroll.setVerticalScrollBarEnabled(false); scroll.setClipToPadding(true); scroll.setPadding(0, 0, 0, 12);
         put(panel, scroll, 0, 10, 1800, 730); FrameLayout grid = new FrameLayout(this); grid.setClipChildren(false);
         int columns = WeberinGeometry.columns(preferences.contains("columns") ? config.columns : 5);
-        int width = WeberinGeometry.gridCardWidth(columns), height = Math.round(width * 156f / 270);
+        int width = Math.min(WeberinGeometry.gridCardWidth(columns) * cardScale() / 100, (1728 - (columns - 1) * 16) / columns);
+        int height = Math.round(width * 156f / 270);
         List<ResolveInfo> ordered = orderedApps();
-        int stepY = columns <= 5 ? 245 : height + 89, rowCount = Math.max(1, (ordered.size() + columns - 1) / columns);
+        int stepY = columns <= 5 ? Math.max(245, height + 89) : height + 89, rowCount = Math.max(1, (ordered.size() + columns - 1) / columns);
         scroll.addView(grid, new ScrollView.LayoutParams(1800, Math.max(718, rowCount * stepY)));
         for (int i = 0; i < ordered.size(); i++) put(grid, tile(ordered.get(i), width, height),
-                WeberinGeometry.gridX(i % columns, columns) - 8, 7 + i / columns * stepY, width + 16, height + 58);
+                WeberinGeometry.gridX(i % columns, columns, width) - 8, 7 + i / columns * stepY, width + 16, height + 58);
         if (ordered.isEmpty()) put(grid, text(getString(R.string.weberin_no_apps), 24, WeberinUi.MUTED, false), 36, 38, 1200, 50);
         wireCards(columns);
     }
@@ -301,34 +396,33 @@ public final class WeberinActivity extends Activity implements WeberinSettings.H
         FrameLayout button = new WeberinUi.CardButton(this); button.setClipChildren(false); button.setFocusableInTouchMode(true);
         button.setId(View.generateViewId()); button.setTag(pkg); button.setContentDescription(name); put(holder, button, 0, 0, width + 16, height + 16);
         FrameLayout face = new FrameLayout(this); face.setBackground(WeberinUi.round(0x660e0e0e, 0x22aaaaaa, 20));
-        face.setClipToOutline(true); put(button, face, 8, 8, width, height); Drawable banner = null;
+        face.setClipToOutline(true); put(button, face, 8, 8, width, height);
+        View fallback = new WeberinArtwork(this, pkg, name); put(face, fallback, 0, 0, width, height);
         if (preferences.getBoolean("weberin_native_banners", false) || config.appBanners.containsKey(pkg)) {
-            banner = banners.get(pkg); if (banner == null) { banner = launch.banner(app); if (banner != null) banners.put(pkg, banner); }
+            ImageView art = new ImageView(this); art.setScaleType(ImageView.ScaleType.FIT_CENTER); put(face, art, 0, 0, width, height);
+            bindBanner(app, art, fallback);
         }
-        if (banner != null) { ImageView art = new ImageView(this); art.setImageDrawable(banner); art.setScaleType(ImageView.ScaleType.FIT_CENTER); put(face, art, 0, 0, width, height); }
-        else put(face, new WeberinArtwork(this, pkg, name), 0, 0, width, height);
-        TextView caption = text(captionName, 18, WeberinUi.MUTED, false); caption.setGravity(Gravity.CENTER); caption.setSingleLine(); caption.setEllipsize(TextUtils.TruncateAt.END);
+        WeberinUi.Caption caption = WeberinUi.newCaption(this, captionName, 18);
         put(holder, caption, 4, height + 22, width + 8, 26);
         if (!preferences.getBoolean("weberin_show_app_names", true)) caption.setVisibility(View.INVISIBLE);
         button.setOnFocusChangeListener((v, focus) -> { focusCard(button, caption, focus); if (focus) { focusedPackage = pkg; focusedTab = -1; } });
         button.setOnClickListener(v -> launch.open(app)); button.setOnLongClickListener(v -> { showTileMenu(app); return true; }); cards.add(button); return holder;
     }
-    private View allAppsTile() {
+    private View allAppsTile(int width, int height) {
         FrameLayout holder = new FrameLayout(this), button = new WeberinUi.CardButton(this);
         button.setFocusableInTouchMode(true); button.setId(View.generateViewId()); button.setTag("@all"); button.setContentDescription(getString(R.string.weberin_all_apps));
-        put(holder, button, 0, 0, 286, 172); FrameLayout face = new FrameLayout(this);
-        face.setBackground(WeberinUi.round(0x990d0d0d, 0x22aaaaaa, 20)); put(button, face, 8, 8, 270, 156);
-        put(face, new WeberinUi.AppsIcon(this), 108, 61, 54, 34);
-        TextView caption = text(getString(R.string.weberin_all_short), 18, WeberinUi.MUTED, false); caption.setGravity(Gravity.CENTER); put(holder, caption, 0, 178, 286, 26);
+        put(holder, button, 0, 0, width + 16, height + 16); FrameLayout face = new FrameLayout(this);
+        face.setBackground(WeberinUi.round(0x990d0d0d, 0x22aaaaaa, 20)); put(button, face, 8, 8, width, height);
+        put(face, new WeberinUi.AppsIcon(this), (width - 54) / 2, (height - 34) / 2, 54, 34);
+        WeberinUi.Caption caption = WeberinUi.newCaption(this, getString(R.string.weberin_all_short), 18); put(holder, caption, 0, height + 22, width + 16, 26);
         if (!preferences.getBoolean("weberin_show_app_names", true)) caption.setVisibility(View.INVISIBLE);
         button.setOnFocusChangeListener((v, focus) -> { focusCard(button, caption, focus); if (focus) { focusedPackage = "@all"; focusedTab = -1; } });
         button.setOnClickListener(v -> { focusedTab = -1; selectPage(1); if (!cards.isEmpty()) cards.get(0).requestFocus(); });
-        button.setOnLongClickListener(v -> { showSettings(); return true; }); cards.add(button); return holder;
+        button.setOnLongClickListener(v -> { onFavoritesEditor(); return true; }); cards.add(button); return holder;
     }
-    private void focusCard(View button, TextView caption, boolean focus) {
+    private void focusCard(View button, WeberinUi.Caption caption, boolean focus) {
         android.graphics.drawable.GradientDrawable outline = WeberinUi.round(Color.TRANSPARENT, 0, 25); if (focus) outline.setStroke(2, 0xffdce6eb);
-        button.setBackground(focus ? outline : null); caption.setTextColor(focus ? WeberinUi.WHITE : WeberinUi.MUTED);
-        caption.setTypeface(WeberinUi.font(this, focus ? 600 : 400));
+        button.setBackground(focus ? outline : null); caption.focus(focus);
     }
     private void wireCards(int columns) {
         for (int i = 0; i < cards.size(); i++) {
@@ -336,7 +430,7 @@ public final class WeberinActivity extends Activity implements WeberinSettings.H
                 if (event.getAction() != KeyEvent.ACTION_DOWN) return false;
                 int direction = key == KeyEvent.KEYCODE_DPAD_LEFT ? -1 : key == KeyEvent.KEYCODE_DPAD_RIGHT ? 1 : key == KeyEvent.KEYCODE_DPAD_UP ? -2 : key == KeyEvent.KEYCODE_DPAD_DOWN ? 2 : 0;
                 if (direction == 0) return false;
-                if (columns == 0) { if (direction == -2) { if (homeAction != null && index < 2) homeAction.requestFocus(); else tabs[page].requestFocus(); }
+                if (columns == 0) { if (direction == -2) { if (index == 0 && dockEditorButton != null) dockEditorButton.requestFocus(); else if (index >= cards.size() - 2) settingsButton.requestFocus(); else tabs[page].requestFocus(); }
                     else if (Math.abs(direction) == 1) cards.get(Math.max(0, Math.min(cards.size() - 1, index + direction))).requestFocus(); }
                 else { int next = WeberinGeometry.neighbour(index, direction, columns, cards.size()); if (next < 0) tabs[page].requestFocus(); else cards.get(next).requestFocus(); }
                 return true;
@@ -346,11 +440,12 @@ public final class WeberinActivity extends Activity implements WeberinSettings.H
     private boolean restoreCardFocus() { if (focusedPackage == null) return false; for (View card : cards) if (focusedPackage.equals(card.getTag())) return card.requestFocus(); return false; }
 
     private List<ResolveInfo> favorites() {
+        if (cachedFavorites != null) return new ArrayList<>(cachedFavorites);
         List<ResolveInfo> result = new ArrayList<>(); Set<String> saved = preferences.getStringSet(FAVORITES, null);
         if (saved != null) { for (ResolveInfo app : apps) if (saved.contains(app.activityInfo.packageName)) result.add(app); }
         else {
-            Set<String> removed = LibraryApps.loadRemoved(this);
-            Order originalOrder = Order.load(Order.file(this));
+            Set<String> removed = snapshot.libraryRemoved;
+            Order originalOrder = snapshot.originalOrder;
             List<String> defaults = new ArrayList<>();
             int limit = Math.max(5, config.dockApps.size());
             if (originalOrder != null && originalOrder.dock.equals(Order.dockKey(config.dockApps))) {
@@ -361,7 +456,7 @@ public final class WeberinActivity extends Activity implements WeberinSettings.H
                     if (component != null) defaults.add(component.getPackageName());
                 }
             }
-            defaults.addAll(config.dockApps); defaults.addAll(new java.util.TreeSet<>(LibraryApps.load(this)));
+            defaults.addAll(config.dockApps); defaults.addAll(new java.util.TreeSet<>(snapshot.libraryAdded));
             Collections.addAll(defaults, "com.google.android.youtube.tv", "com.happproxy", "com.happproxy.tv", "ru.kinopoisk.tv", "ru.ivi.client", "ru.okko");
             for (String pkg : defaults) for (ResolveInfo app : apps) { if (result.size() >= limit) break;
                 if (app.activityInfo.packageName.equals(pkg) && !removed.contains(pkg) && !config.hiddenApps.contains(pkg) && !result.contains(app)) result.add(app); }
@@ -373,17 +468,18 @@ public final class WeberinActivity extends Activity implements WeberinSettings.H
         try { org.json.JSONArray json = new org.json.JSONArray(preferences.getString(FAVORITE_ORDER, "[]")); for (int i = 0; i < json.length(); i++) order.add(json.getString(i)); } catch (org.json.JSONException ignored) { }
         if (!order.isEmpty()) Collections.sort(result, (a, b) -> Integer.compare(rank(order, a), rank(order, b)));
         else if (saved == null) {
-            Map<String, Integer> ranks = Order.ranks(Order.load(Order.file(this)), config.dockApps);
+            Map<String, Integer> ranks = Order.ranks(snapshot.originalOrder, config.dockApps);
             Collections.sort(result, (a, b) -> Order.compare(ranks, new android.content.ComponentName(a.activityInfo.packageName, a.activityInfo.name).flattenToShortString(),
                     new android.content.ComponentName(b.activityInfo.packageName, b.activityInfo.name).flattenToShortString()));
         }
-        return result;
+        cachedFavorites = new ArrayList<>(result); return result;
     }
     private int rank(List<String> order, ResolveInfo app) { int index = order.indexOf(app.activityInfo.packageName); return index < 0 ? Integer.MAX_VALUE : index; }
     private List<ResolveInfo> orderedApps() {
+        if (cachedOrdered != null) return new ArrayList<>(cachedOrdered);
         List<ResolveInfo> ordered = new ArrayList<>(favorites()), remaining = new ArrayList<>();
         for (ResolveInfo app : apps) if (!ordered.contains(app)) remaining.add(app);
-        Map<String, Integer> original = Order.ranks(Order.load(Order.file(this)), config.dockApps);
+        Map<String, Integer> original = Order.ranks(snapshot.originalOrder, config.dockApps);
         Collections.sort(remaining, (a, b) -> {
             int saved = Order.compare(original,
                     new android.content.ComponentName(a.activityInfo.packageName, a.activityInfo.name).flattenToShortString(),
@@ -396,7 +492,7 @@ public final class WeberinActivity extends Activity implements WeberinSettings.H
             for (int i = 0; i < json.length(); i++) custom.add(json.getString(i));
         } catch (org.json.JSONException ignored) { }
         if (!custom.isEmpty()) Collections.sort(ordered, (a, b) -> Integer.compare(rank(custom, a), rank(custom, b)));
-        return ordered;
+        cachedOrdered = new ArrayList<>(ordered); return ordered;
     }
     private int artworkOrder(ResolveInfo app) {
         String name = launch.label(app).toLowerCase(Locale.ROOT).replace(" ", "");
@@ -407,12 +503,13 @@ public final class WeberinActivity extends Activity implements WeberinSettings.H
     private void moveGridApp(List<ResolveInfo> ordered, int from, int to) {
         Collections.swap(ordered, from, to); org.json.JSONArray json = new org.json.JSONArray();
         for (ResolveInfo app : ordered) json.put(app.activityInfo.packageName);
-        preferences.edit().putString("weberin_grid_order", json.toString()).apply(); populatePage(); focusNearest(to);
+        preferences.edit().putString("weberin_grid_order", json.toString()).apply(); cachedOrdered = null; populatePage(); focusNearest(to);
     }
     private void showTileMenu(ResolveInfo app) {
         String pkg = app.activityInfo.packageName; List<ResolveInfo> current = favorites(); int found = -1;
         for (int i = 0; i < current.size(); i++) if (pkg.equals(current.get(i).activityInfo.packageName)) found = i;
         final int index = found; List<String> labels = new ArrayList<>(); List<Runnable> actions = new ArrayList<>();
+        labels.add(getString(R.string.wf_title)); actions.add(this::onFavoritesEditor);
         labels.add(getString(index >= 0 ? R.string.library_remove_shortcut : R.string.library_add_home));
         actions.add(() -> { Set<String> next = new HashSet<>(); for (ResolveInfo favorite : current) next.add(favorite.activityInfo.packageName);
             if (index >= 0) { next.remove(pkg); current.remove(index); } else { next.add(pkg); current.add(app); }
@@ -431,6 +528,7 @@ public final class WeberinActivity extends Activity implements WeberinSettings.H
     private void saveFavorites(List<ResolveInfo> order, Set<String> selected) {
         org.json.JSONArray json = new org.json.JSONArray(); for (ResolveInfo app : order) json.put(app.activityInfo.packageName);
         preferences.edit().putStringSet(FAVORITES, selected).putString(FAVORITE_ORDER, json.toString()).apply();
+        cachedFavorites = null; cachedOrdered = null;
     }
     private void moveFavorite(List<ResolveInfo> current, int from, int to) {
         Collections.swap(current, from, to); Set<String> selected = new HashSet<>(); for (ResolveInfo app : current) selected.add(app.activityInfo.packageName);
@@ -439,11 +537,12 @@ public final class WeberinActivity extends Activity implements WeberinSettings.H
     private void focusNearest(int previous) { pageContent.post(() -> { if (!restoreCardFocus() && !cards.isEmpty()) cards.get(Math.max(0, Math.min(cards.size() - 1, previous))).requestFocus(); }); }
 
     private void addFullHome() {
+        int x = leftWeather() ? 560 : 96;
         if (preferences.getBoolean("weberin_show_news", true)) {
-        TextView eyebrow = text(getString(R.string.weberin_home_eyebrow), 16, 0xffa9b0bb, true); eyebrow.setLetterSpacing(.10f); put(pageContent, eyebrow, 96, 222, 950, 28);
-        TextView title = text(getString(R.string.weberin_new_releases), 76, WeberinUi.WHITE, true); title.setTypeface(WeberinUi.font(this, 700)); put(pageContent, title, 96, 263, 1000, 92);
+        TextView eyebrow = text(getString(R.string.weberin_home_eyebrow), 16, 0xffa9b0bb, true); eyebrow.setLetterSpacing(.10f); put(pageContent, eyebrow, x, 222, 950, 28);
+        TextView title = text(getString(R.string.weberin_new_releases), 76, WeberinUi.WHITE, true); title.setTypeface(WeberinUi.font(this, 700)); put(pageContent, title, x, 263, 1000, 92);
         // The artwork's films are examples. The owner has not chosen a content source yet.
-        put(pageContent, text(getString(R.string.weberin_news_source_missing), 24, WeberinUi.MUTED, false), 96, 382, 1000, 64);
+        put(pageContent, text(getString(R.string.weberin_news_source_missing), 24, WeberinUi.MUTED, false), x, 382, 1000, 64);
         }
         if (preferences.getBoolean("weberin_show_xbox", true)) for (ResolveInfo app : apps) {
             if (!app.activityInfo.packageName.startsWith("com.microsoft.xbox")) continue;
@@ -457,10 +556,20 @@ public final class WeberinActivity extends Activity implements WeberinSettings.H
                 if (key == KeyEvent.KEYCODE_DPAD_DOWN) { if (!cards.isEmpty()) cards.get(0).requestFocus(); else tabs[0].requestFocus(); return true; }
                 return key == KeyEvent.KEYCODE_DPAD_LEFT || key == KeyEvent.KEYCODE_DPAD_RIGHT;
             });
-            homeAction = xbox; put(pageContent, xbox, 96, 616, 165, 66); break;
+            homeAction = xbox; put(pageContent, xbox, x, 616, 165, 66); break;
         }
     }
-    private void addWeatherPanel() { weatherPanel = new FrameLayout(this); put(pageContent, weatherPanel, 1512, 290, 312, 330); updateWeatherPanel(); requestWeatherIfNeeded(); }
+    private boolean leftWeather() {
+        return preferences.getBoolean("weberin_show_weather", preferences.getBoolean("weberin_home_full", false))
+                && "left".equals(preferences.getString("weberin_weather_position", "right"));
+    }
+    private void addWeatherPanel() {
+        weatherPanel = new FrameLayout(this);
+        float scale = Math.max(80, Math.min(120, preferences.getInt("weberin_weather_size", 100))) / 100f;
+        weatherPanel.setPivotX(0); weatherPanel.setPivotY(0); weatherPanel.setScaleX(scale); weatherPanel.setScaleY(scale);
+        put(pageContent, weatherPanel, leftWeather() ? 96 : Math.round(1824 - 312 * scale), 290, 312, 330);
+        updateWeatherPanel(); requestWeatherIfNeeded();
+    }
     private void weatherLine(CharSequence value, int size, int color, int y, int height) { TextView line = text(value, size, color, false); line.setGravity(Gravity.CENTER); put(weatherPanel, line, 0, y, 312, height); }
     private void updateWeatherPanel() {
         if (weatherPanel == null) return; weatherPanel.removeAllViews();
@@ -490,28 +599,111 @@ public final class WeberinActivity extends Activity implements WeberinSettings.H
     }
     private void showSettings() {
         if (overlay != null) return;
-        // Keep the two panels modal even if firmware chooses its own geometric focus neighbour.
-        for (int i = 0; i < scene.getChildCount(); i++) {
-            View child = scene.getChildAt(i);
-            child.setFocusable(false);
-            child.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS);
-            if (child instanceof android.view.ViewGroup) ((android.view.ViewGroup) child)
-                    .setDescendantFocusability(android.view.ViewGroup.FOCUS_BLOCK_DESCENDANTS);
-        }
+        scene.setDescendantFocusability(android.view.ViewGroup.FOCUS_BLOCK_DESCENDANTS);
+        scene.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS);
         List<ResolveInfo> ordered = orderedApps();
-        settingsPanel = new WeberinSettings(this, ordered); overlay = settingsPanel.create(); put(scene, overlay, 0, 0, 1920, 1080);
+        settingsPanel = new WeberinSettings(this, ordered); overlay = settingsPanel.create(); put(modalHost, overlay, 0, 0, 1920, 1080);
     }
     @Override public void onBackPressed() {
+        if (favoritesEditor != null) { favoritesEditor.handleBack(); return; }
         if (settingsPanel != null) { settingsPanel.handleBack(); return; }
         if (page != 0) { focusedTab = -1; selectPage(0); if (!cards.isEmpty()) cards.get(0).requestFocus(); else tabs[0].requestFocus(); }
         else moveTaskToBack(true);
     }
     @Override public Activity activity() { return this; }
     @Override public SharedPreferences preferences() { return preferences; }
-    @Override public void onSettingsChanged() { config = Config.load(this); launch = new WeberinLaunch(this, config); banners.clear(); }
+    @Override public Config config() { return config; }
+    @Override public String appLabel(ResolveInfo app) { return launch.label(app); }
+    @Override public String label(ResolveInfo app) { return launch.label(app); }
+    @Override public void bindAppIcon(ResolveInfo app, ImageView target) {
+        String pkg = app.activityInfo.packageName; target.setTag(pkg);
+        Drawable cached = icons.get(pkg); if (cached != null) { target.setImageDrawable(cached); return; }
+        final java.lang.ref.WeakReference<ImageView> reference = new java.lang.ref.WeakReference<>(target);
+        artworkExecutor.execute(() -> {
+            Drawable icon = null;
+            try {
+                Drawable source = app.loadIcon(getPackageManager());
+                Bitmap bitmap = Bitmap.createBitmap(96, 96, Bitmap.Config.ARGB_8888);
+                source.setBounds(0, 0, 96, 96); source.draw(new android.graphics.Canvas(bitmap));
+                icon = new android.graphics.drawable.BitmapDrawable(getResources(), bitmap);
+            } catch (RuntimeException | OutOfMemoryError ignored) { }
+            final Drawable result = icon;
+            runOnUiThread(() -> {
+                if (isDestroyed() || result == null) return;
+                icons.put(pkg, result); ImageView view = reference.get();
+                if (view != null && pkg.equals(view.getTag())) view.setImageDrawable(result);
+            });
+        });
+    }
+    private void bindBanner(ResolveInfo app, ImageView target, View fallback) {
+        String pkg = app.activityInfo.packageName; target.setTag(pkg);
+        Drawable cached = banners.get(pkg);
+        if (cached != null) { target.setImageDrawable(cached); fallback.setVisibility(View.INVISIBLE); return; }
+        if (missingBanners.contains(pkg)) return;
+        int generation = catalogGeneration; WeberinLaunch resolver = launch;
+        final java.lang.ref.WeakReference<ImageView> reference = new java.lang.ref.WeakReference<>(target);
+        final java.lang.ref.WeakReference<View> placeholder = new java.lang.ref.WeakReference<>(fallback);
+        artworkExecutor.execute(() -> {
+            Drawable banner = null;
+            try {
+                Drawable source = resolver.banner(app);
+                if (source != null) {
+                    int w = Math.max(1, source.getIntrinsicWidth()), h = Math.max(1, source.getIntrinsicHeight());
+                    float factor = Math.min(1f, Math.min(640f / w, 360f / h));
+                    w = Math.max(1, Math.round(w * factor)); h = Math.max(1, Math.round(h * factor));
+                    Bitmap bitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+                    source.setBounds(0, 0, w, h); source.draw(new android.graphics.Canvas(bitmap));
+                    banner = new android.graphics.drawable.BitmapDrawable(getResources(), bitmap);
+                }
+            } catch (RuntimeException | OutOfMemoryError ignored) { }
+            final Drawable result = banner;
+            runOnUiThread(() -> {
+                if (isDestroyed() || generation != catalogGeneration) return;
+                if (result == null) { missingBanners.add(pkg); return; }
+                banners.put(pkg, result); ImageView view = reference.get(); View behind = placeholder.get();
+                if (view != null && pkg.equals(view.getTag())) {
+                    view.setImageDrawable(result); if (behind != null) behind.setVisibility(View.INVISIBLE);
+                }
+            });
+        });
+    }
+    @Override public void onSettingsChanged() {
+        sceneNeedsRender = true;
+        WeberinDeviceControls.applyWindowBrightness(this, preferences);
+    }
     @Override public void onCloseSettings() {
-        if (overlay != null) scene.removeView(overlay); overlay = null; settingsPanel = null;
-        config = Config.load(this); launch = new WeberinLaunch(this, config); render(); scene.post(() -> settingsButton.requestFocus());
+        if (overlay != null) modalHost.removeView(overlay); overlay = null; settingsPanel = null;
+        scene.setDescendantFocusability(android.view.ViewGroup.FOCUS_AFTER_DESCENDANTS);
+        scene.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_AUTO);
+        settingsButton.requestFocus();
+        refreshCatalog();
+    }
+    @Override public void onFavoritesEditor() {
+        if (favoritesEditor != null) return;
+        if (overlay != null) { settingsFocusBeforeEditor = overlay.findFocus(); overlay.setVisibility(View.GONE); }
+        scene.setDescendantFocusability(android.view.ViewGroup.FOCUS_BLOCK_DESCENDANTS);
+        List<String> selected = new ArrayList<>(); for (ResolveInfo app : favorites()) selected.add(app.activityInfo.packageName);
+        favoritesEditor = new WeberinFavoritesEditor(this, apps, selected); favoritesOverlay = favoritesEditor.create();
+        put(modalHost, favoritesOverlay, 0, 0, 1920, 1080);
+    }
+    @Override public void onSaveFavorites(List<String> packages) {
+        preferences.edit().putStringSet(FAVORITES, new HashSet<>(packages))
+                .putString(FAVORITE_ORDER, new org.json.JSONArray(packages).toString()).apply();
+        cachedFavorites = null; cachedOrdered = null; sceneNeedsRender = true;
+        closeFavoritesEditor(true);
+    }
+    @Override public void onCancelFavorites() { closeFavoritesEditor(false); }
+    private void closeFavoritesEditor(boolean saved) {
+        if (favoritesOverlay != null) modalHost.removeView(favoritesOverlay); favoritesOverlay = null; favoritesEditor = null;
+        if (overlay != null) {
+            overlay.setVisibility(View.VISIBLE);
+            if (settingsFocusBeforeEditor != null) settingsFocusBeforeEditor.requestFocus();
+        } else {
+            scene.setDescendantFocusability(android.view.ViewGroup.FOCUS_AFTER_DESCENDANTS);
+            if (saved) populatePage();
+            if (!restoreCardFocus() && !cards.isEmpty()) cards.get(0).requestFocus();
+        }
+        settingsFocusBeforeEditor = null;
     }
     @Override public void onOriginalInterface() { preferences.edit().putBoolean("weberin_layout", false).apply(); finish(); }
     @Override public void onWallpaperPicker() { showWallpaperPicker(); }
@@ -525,7 +717,15 @@ public final class WeberinActivity extends Activity implements WeberinSettings.H
         }
     }
     @Override public void onWeatherCityPicker() { showWeatherCityPicker(); }
-    @Override public void onReleaseLauncherMemory() { banners.clear(); wallpaper = null; wallpaperKey = null; }
+    @Override public void onReleaseLauncherMemory() {
+        banners.clear(); missingBanners.clear(); icons.evictAll(); releaseHiddenPages();
+    }
+    private void releaseHiddenPages() {
+        if (pagesHost == null) return;
+        for (int i = 0; i < pages.length; i++) if (i != page && pages[i] != null) {
+            pagesHost.removeView(pages[i].view); pages[i] = null;
+        }
+    }
     @Override public void openStartupIntent(Intent intent) { launch.openIntent(intent); }
     @Override public void openStartupInput(String inputId) { launch.openInput(inputId); }
     private void showWeatherCityPicker() {
@@ -550,7 +750,11 @@ public final class WeberinActivity extends Activity implements WeberinSettings.H
     }
     private void openSettingsTarget(Intent intent) { launch.openIntent(intent); }
     @Override public void onTrimMemory(int level) {
-        super.onTrimMemory(level); if (level >= TRIM_MEMORY_UI_HIDDEN) banners.clear(); if (level >= TRIM_MEMORY_RUNNING_CRITICAL) { wallpaper = null; wallpaperKey = null; }
+        super.onTrimMemory(level);
+        if (level >= TRIM_MEMORY_UI_HIDDEN || level == TRIM_MEMORY_RUNNING_CRITICAL) onReleaseLauncherMemory();
     }
-    @Override protected void onDestroy() { weatherGeneration++; weatherExecutor.shutdownNow(); startup.close(); banners.clear(); wallpaper = null; super.onDestroy(); }
+    @Override protected void onDestroy() {
+        unregisterReceiver(packages); weatherGeneration++; weatherExecutor.shutdownNow(); catalogExecutor.shutdownNow(); artworkExecutor.shutdownNow();
+        startup.close(); banners.clear(); icons.evictAll(); wallpaper = null; super.onDestroy();
+    }
 }

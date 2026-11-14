@@ -15,7 +15,9 @@ final class WeberinGeometry {
     static int gridCardWidth(int columns) { return columns <= 5 ? CARD_WIDTH : (1728 - (columns - 1) * 32) / columns; }
 
     static int gridX(int index, int columns) {
-        int width = gridCardWidth(columns);
+        return gridX(index, columns, gridCardWidth(columns));
+    }
+    static int gridX(int index, int columns, int width) {
         return 36 + (int) (index * (1728f - width) / (columns - 1));
     }
 

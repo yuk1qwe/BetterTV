@@ -28,6 +28,7 @@ final class WeberinLaunch {
     private final Activity activity;
     private final Config config;
     private final Set<String> iconTiles;
+    private final java.util.Map<String, String> labels = new java.util.HashMap<>();
 
     WeberinLaunch(Activity activity, Config config) {
         this.activity = activity;
@@ -37,9 +38,13 @@ final class WeberinLaunch {
 
     String label(ResolveInfo app) {
         String pkg = app.activityInfo.packageName;
+        String cached = labels.get(pkg);
+        if (cached != null) return cached;
         String value = config.appLabels.containsKey(pkg) ? config.appLabels.get(pkg)
                 : String.valueOf(app.loadLabel(activity.getPackageManager()));
-        return Cards.cleanLabel(value, pkg);
+        String clean = Cards.cleanLabel(value, pkg);
+        labels.put(pkg, clean);
+        return clean;
     }
 
     /** Null means the caller should draw the real app icon and its label. */

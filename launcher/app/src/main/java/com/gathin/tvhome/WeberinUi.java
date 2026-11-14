@@ -8,10 +8,16 @@ import android.graphics.Paint;
 import android.graphics.Path;
 import android.graphics.PixelFormat;
 import android.graphics.RadialGradient;
+import android.graphics.Rect;
 import android.graphics.RectF;
 import android.graphics.Shader;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
+import android.text.Layout;
+import android.text.StaticLayout;
+import android.text.TextDirectionHeuristics;
+import android.text.TextPaint;
+import android.text.TextUtils;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
@@ -41,6 +47,65 @@ final class WeberinUi {
         view.setFontFeatureSettings("kern");
         view.setTypeface(font(context, bold ? 600 : 400));
         return view;
+    }
+
+    static Caption newCaption(Context context, String text, int size) {
+        return new Caption(context, text, size);
+    }
+
+    /** Card labels keep both font measurements ready; moving focus redraws without relaying out the grid. */
+    static final class Caption extends View {
+        private final String text;
+        private final TextPaint regular = new TextPaint(Paint.ANTI_ALIAS_FLAG | Paint.SUBPIXEL_TEXT_FLAG);
+        private final TextPaint semibold = new TextPaint(Paint.ANTI_ALIAS_FLAG | Paint.SUBPIXEL_TEXT_FLAG);
+        private StaticLayout regularLayout, semiboldLayout;
+        private float regularTop, semiboldTop;
+        private boolean highlighted;
+
+        Caption(Context context, String text, int size) {
+            super(context);
+            this.text = text;
+            regular.setTextSize(size); regular.setTypeface(font(context, 400)); regular.setColor(MUTED);
+            semibold.setTextSize(size); semibold.setTypeface(font(context, 600)); semibold.setColor(WHITE);
+            regular.setFontFeatureSettings("kern"); semibold.setFontFeatureSettings("kern");
+            // The focusable card already exposes the complete app label.
+            setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_NO);
+        }
+
+        void focus(boolean highlighted) {
+            if (this.highlighted == highlighted) return;
+            this.highlighted = highlighted;
+            invalidate();
+        }
+
+        @Override protected void onSizeChanged(int width, int height, int oldWidth, int oldHeight) {
+            super.onSizeChanged(width, height, oldWidth, oldHeight);
+            int available = Math.max(1, width - getPaddingLeft() - getPaddingRight());
+            regularLayout = layout(regular, available);
+            semiboldLayout = layout(semibold, available);
+            int contentHeight = height - getPaddingTop() - getPaddingBottom();
+            regularTop = getPaddingTop() + (contentHeight - regularLayout.getHeight()) / 2f;
+            semiboldTop = getPaddingTop() + (contentHeight - semiboldLayout.getHeight()) / 2f;
+        }
+
+        private StaticLayout layout(TextPaint paint, int width) {
+            return StaticLayout.Builder.obtain(text, 0, text.length(), paint, width)
+                    .setAlignment(Layout.Alignment.ALIGN_CENTER)
+                    .setTextDirection(getLayoutDirection() == LAYOUT_DIRECTION_RTL
+                            ? TextDirectionHeuristics.FIRSTSTRONG_RTL : TextDirectionHeuristics.FIRSTSTRONG_LTR)
+                    .setMaxLines(1).setEllipsize(TextUtils.TruncateAt.END).setEllipsizedWidth(width)
+                    .setIncludePad(false).build();
+        }
+
+        @Override protected void onDraw(Canvas canvas) {
+            super.onDraw(canvas);
+            StaticLayout layout = highlighted ? semiboldLayout : regularLayout;
+            if (layout == null) return;
+            canvas.save();
+            canvas.translate(getPaddingLeft(), highlighted ? semiboldTop : regularTop);
+            layout.draw(canvas);
+            canvas.restore();
+        }
     }
 
     static GradientDrawable round(int fill, int border, int radius) {
@@ -133,18 +198,29 @@ final class WeberinUi {
         private final Path clip = new Path();
         private final boolean tinted;
         private final int opacity;
+        private Shader lowerTint, upperTint;
         Surface(boolean tinted, int opacity) { this.tinted = tinted; this.opacity = Math.max(0, Math.min(255, opacity)); }
+        @Override protected void onBoundsChange(Rect bounds) {
+            super.onBoundsChange(bounds);
+            rect.set(bounds); rect.inset(.7f, .7f);
+            clip.reset();
+            lowerTint = null; upperTint = null;
+            if (tinted && rect.width() > 0 && rect.height() > 0) {
+                clip.addRoundRect(rect, 32, 32, Path.Direction.CW);
+                lowerTint = new RadialGradient(rect.left + rect.width() * .12f, rect.bottom,
+                        rect.width() * .52f, 0x483e1c32, Color.TRANSPARENT, Shader.TileMode.CLAMP);
+                upperTint = new RadialGradient(rect.right, rect.top, rect.width() * .58f,
+                        0x5036274b, Color.TRANSPARENT, Shader.TileMode.CLAMP);
+            }
+        }
         @Override public void draw(Canvas canvas) {
-            rect.set(getBounds()); rect.inset(.7f, .7f);
             paint.setShader(null); paint.setStyle(Paint.Style.FILL); paint.setColor(opacity << 24);
             canvas.drawRoundRect(rect, 32, 32, paint);
-            if (tinted) {
-                canvas.save(); clip.reset(); clip.addRoundRect(rect, 32, 32, Path.Direction.CW); canvas.clipPath(clip);
-                paint.setShader(new RadialGradient(rect.left + rect.width() * .12f, rect.bottom,
-                        rect.width() * .52f, 0x483e1c32, Color.TRANSPARENT, Shader.TileMode.CLAMP));
+            if (lowerTint != null && upperTint != null) {
+                canvas.save(); canvas.clipPath(clip);
+                paint.setShader(lowerTint);
                 canvas.drawRect(rect, paint);
-                paint.setShader(new RadialGradient(rect.right, rect.top, rect.width() * .58f,
-                        0x5036274b, Color.TRANSPARENT, Shader.TileMode.CLAMP));
+                paint.setShader(upperTint);
                 canvas.drawRect(rect, paint); canvas.restore(); paint.setShader(null);
             }
             paint.setStyle(Paint.Style.STROKE); paint.setStrokeWidth(1.2f); paint.setColor(0x705f6063);

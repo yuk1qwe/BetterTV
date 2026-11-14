@@ -458,10 +458,40 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     /** clock_format, for the race panel's session times (the TextClocks take it in onCreate). */
     private String clockFormat = "system";
     private java.util.Map<Integer, String> homeHoldAppKeys = java.util.Collections.emptyMap();
+    /** In Weberin mode this activity is normally only the stable HOME entry point, with no original views. */
+    private boolean originalInitialized;
+    private boolean routerRecreationPending;
+    private static final String ORIGINAL_ACTION_PENDING = "com.gathin.tvhome.extra.ORIGINAL_ACTION_PENDING";
+    /** A one-off original Inputs, App library or settings request keeps that presentation in front. */
+    private boolean originalActionSession;
+
+    private boolean prefersWeberin() {
+        return getSharedPreferences(Config.SETTINGS_NAME, MODE_PRIVATE).getBoolean("weberin_layout", true);
+    }
+
+    private boolean needsOriginal(Intent intent) {
+        return WeberinRouting.initializeOriginal(prefersWeberin(), intent == null ? null : intent.getAction(),
+                intent != null && intent.getBooleanExtra(LauncherSettingsActivity.EXTRA_REORDER, false));
+    }
+
+    private void recreateOriginal() {
+        if (routerRecreationPending) return;
+        routerRecreationPending = true;
+        if (WeberinRouting.originalAction(getIntent() == null ? null : getIntent().getAction())) {
+            getIntent().putExtra(ORIGINAL_ACTION_PENDING, true);
+        }
+        recreate();
+    }
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        // Do not inflate, decode and query the original home only to cover it immediately with Weberin.
+        // Its views and callbacks are created on demand when the owner selects it or requests one of its tools.
+        if (!needsOriginal(getIntent())) return;
+        originalInitialized = true;
+        originalActionSession = prefersWeberin()
+                && WeberinRouting.originalAction(getIntent() == null ? null : getIntent().getAction());
         setContentView(R.layout.activity_main);
         density = getResources().getDisplayMetrics().density;
         // config.xml, overlaid by config.json from a pushed theme (see Config and tools/theme.sh).
@@ -474,9 +504,8 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         libraryOkOpens = cfg.libraryOkOpens;
         // restore_key_services: after a force stop, put back the remote's accessibility helpers that Android took
         // off the list (needs WRITE_SECURE_SETTINGS, granted by build-and-install with RESTORE_KEY_SERVICES=1).
-        if (cfg.restoreKeyServices) ServiceRepair.restore(this);
+        prepareSharedFeatures(this, cfg);
         settingsRevision = settingsRevision();
-        applyViewInputsHandler(cfg.handleViewInputs);
         settingsKeycodes = cfg.settingsKeycodes;
         settingsKeyPanel = cfg.settingsKeyPanel;
         settingsKeyClearTask = cfg.settingsKeyClearTask;
@@ -972,8 +1001,12 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
                     .removeCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
                     .build(), vpnCallback);
         }
-        // Not after recreate(): the launch intent survives it and would open the settings again.
-        if (savedInstanceState == null && !openLauncherSettingsIfAsked(getIntent()) && !openLibraryIfAsked(getIntent())) {
+        // A lightweight router has not handled its requested tool yet. Other recreations must not
+        // replay the launch intent and reopen a page the owner already left.
+        boolean pendingOriginalAction = getIntent().getBooleanExtra(ORIGINAL_ACTION_PENDING, false);
+        getIntent().removeExtra(ORIGINAL_ACTION_PENDING);
+        if ((savedInstanceState == null || pendingOriginalAction)
+                && !openLauncherSettingsIfAsked(getIntent()) && !openLibraryIfAsked(getIntent())) {
             openInputsIfAsked(getIntent());
         }
     }
@@ -983,10 +1016,11 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
      * manifest, so a TV with its own input picker never sees it; only the sets that need it turn it on. Written
      * only when the state differs, so an ordinary start does not touch the package manager.
      */
-    private void applyViewInputsHandler(boolean on) {
-        ComponentName handler = new ComponentName(this, InputsRequestActivity.class);
-        PackageManager pm = getPackageManager();
-        int want = on ? PackageManager.COMPONENT_ENABLED_STATE_ENABLED : PackageManager.COMPONENT_ENABLED_STATE_DEFAULT;
+    static void prepareSharedFeatures(Context context, Config config) {
+        if (config.restoreKeyServices) ServiceRepair.restore(context);
+        ComponentName handler = new ComponentName(context, InputsRequestActivity.class);
+        PackageManager pm = context.getPackageManager();
+        int want = config.handleViewInputs ? PackageManager.COMPONENT_ENABLED_STATE_ENABLED : PackageManager.COMPONENT_ENABLED_STATE_DEFAULT;
         if (pm.getComponentEnabledSetting(handler) != want) {
             pm.setComponentEnabledSetting(handler, want, PackageManager.DONT_KILL_APP);
         }
@@ -1058,6 +1092,13 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     @Override
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
+        if (!originalInitialized) {
+            setIntent(intent == null ? new Intent(Intent.ACTION_MAIN) : intent);
+            if (needsOriginal(getIntent())) recreateOriginal();
+            return;
+        }
+        originalActionSession = prefersWeberin()
+                && WeberinRouting.originalAction(intent == null ? null : intent.getAction());
         if (intent != null && intent.getBooleanExtra(LauncherSettingsActivity.EXTRA_REORDER, false)) {
             // A request from the alternate home's settings must reach the same original editor as
             // onActivityResult. singleTask already removed the alternate activity from this task.
@@ -1087,6 +1128,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     @Override
     protected void onStart() {
         super.onStart();
+        if (!originalInitialized) return;
         stopped = false;
         started = true;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -1102,6 +1144,12 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     @Override
     protected void onResume() {
         super.onResume();
+        if (!originalInitialized) {
+            if (routerRecreationPending) return;
+            if (needsOriginal(getIntent())) recreateOriginal();
+            else startActivity(new Intent(this, WeberinActivity.class));
+            return;
+        }
         resumed = true;
         // A festival that started or ended while Home was in the background: rebuild with or without it.
         if (festive != festival.active(LocalDate.now())) {
@@ -1119,7 +1167,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         // the original editor, so let that request finish even while Weberin is the preferred home.
         if (getSharedPreferences(Config.SETTINGS_NAME, MODE_PRIVATE).getBoolean("weberin_layout", true)
                 && !getIntent().getBooleanExtra(LauncherSettingsActivity.EXTRA_REORDER, false)
-                && !weberinReorderSession && !reordering) {
+                && !weberinReorderSession && !reordering && !originalActionSession) {
             startActivity(new Intent(this, WeberinActivity.class));
             return;
         }
@@ -1318,6 +1366,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     @Override
     public void onUserInteraction() {
         super.onUserInteraction();
+        if (!originalInitialized) return;
         restartIdleClock();
     }
 
@@ -1329,7 +1378,9 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     @Override
     protected void onPause() {
         super.onPause();
+        if (!originalInitialized) return;
         resumed = false;
+        originalActionSession = false;
         // No UP reaches a paused Home, so a vendor-key hold it saw go down would still open its app later.
         // Only Home's own share is dropped: a key service that saw the same DOWN keeps its hold.
         RemoteKeys.release(this);
@@ -1358,6 +1409,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     @Override
     protected void onStop() {
         super.onStop();
+        if (!originalInitialized) return;
         started = false;
         unregisterReceiver(timeReceiver);
         clockRefresh.stop();
@@ -1378,6 +1430,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     @Override
     public void onTrimMemory(int level) {
         super.onTrimMemory(level);
+        if (!originalInitialized) return;
         // RUNNING_LOW and CRITICAL also arrive while Home is visible when an accessibility service keeps the
         // process in the foreground; never blank the screen the owner is looking at.
         if (!MemoryTrimPolicy.shouldRelease(level, started)) return;
@@ -1401,6 +1454,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     @Override
     public void onWindowFocusChanged(boolean hasFocus) {
         super.onWindowFocusChanged(hasFocus);
+        if (!originalInitialized) return;
         if (hasFocus) {
             startPendingSettingsReorder();
             if (libraryFocusPending && appLibrary == null) focusLibrary();
@@ -1413,6 +1467,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     @Override
     protected void onDestroy() {
         super.onDestroy();
+        if (!originalInitialized) return;
         RemoteKeys.release(this);
         cancelHoldOk();
         if (gameDay != null) gameDay.shutdown();
@@ -1463,6 +1518,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
      */
     @Override
     public boolean dispatchKeyEvent(KeyEvent event) {
+        if (!originalInitialized) return super.dispatchKeyEvent(event);
         if (homeIgnoreChannelKeys && RemoteKeys.isChannelKey(event.getKeyCode())) return true;
         // Vendor keys (TCL Netflix button, 4062) never reach the key services, only the focused window, so their
         // "hold:" entries run here too or nowhere. Only while resumed: onPause releases Home's holds, and a DOWN
@@ -1817,6 +1873,12 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     @Override
     @SuppressWarnings("deprecation")
     public void onBackPressed() {
+        if (!originalInitialized) { moveTaskToBack(true); return; }
+        if (originalActionSession && prefersWeberin()) {
+            originalActionSession = false;
+            startActivity(new Intent(this, WeberinActivity.class));
+            return;
+        }
         // Home screen: Back goes nowhere, unless back_opens_clock is on.
         if (backOpensClock) startActivity(new Intent(this, ClockActivity.class));
     }
