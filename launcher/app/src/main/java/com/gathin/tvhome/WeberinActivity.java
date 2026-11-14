@@ -1,876 +1,556 @@
 package com.gathin.tvhome;
 
 import android.app.Activity;
-import android.content.ActivityNotFoundException;
+import android.app.AlertDialog;
+import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.Color;
-import android.graphics.Typeface;
-import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.Drawable;
+import android.net.ConnectivityManager;
+import android.net.NetworkInfo;
 import android.os.Bundle;
+import android.os.SystemClock;
+import android.provider.Settings;
+import android.text.TextUtils;
+import android.util.TypedValue;
 import android.view.Gravity;
+import android.view.KeyEvent;
 import android.view.View;
+import android.widget.EditText;
 import android.widget.FrameLayout;
-import android.widget.GridLayout;
 import android.widget.HorizontalScrollView;
 import android.widget.ImageView;
-import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextClock;
 import android.widget.TextView;
 import android.widget.Toast;
-
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
-/** Alternate home presentation. The original Home activity remains the system entry point. */
-public final class WeberinActivity extends Activity {
-    private static final String FAVORITES = "weberin_favorites";
+/** Native alternate presentation; the original launcher and its settings remain available. */
+public final class WeberinActivity extends Activity implements WeberinSettings.Host, WeberinStartup.Host {
+    private static final String FAVORITES = "weberin_favorites", FAVORITE_ORDER = "weberin_favorites_order";
+    private static final String DEFAULT_WALLPAPER = "01-windows-black-1080p.png";
     private SharedPreferences preferences;
-    private LinearLayout content;
+    private Config config;
+    private WeberinLaunch launch;
+    private WeberinStartup startup;
+    private FrameLayout scene, pageContent, weatherPanel, overlay;
+    private WeberinSettings settingsPanel;
     private final List<ResolveInfo> apps = new ArrayList<>();
-    private int page;
+    private final List<View> cards = new ArrayList<>();
+    private final TextView[] tabs = new TextView[3];
+    private ImageView settingsButton;
+    private View homeAction;
+    private int page, focusedTab = -1;
     private String focusedPackage;
-    private boolean restoringFocus;
-    private android.graphics.Bitmap cachedWallpaper;
-    private String cachedWallpaperKey;
-    private boolean focusSelectedTab;
-    private boolean initialFocus = true;
-    private FrameLayout settingsOverlay;
-    private Config activeConfig;
-    private int settingsCategory;
-    private final List<TextView> settingsCategoryRows = new ArrayList<>();
-    private final java.util.concurrent.ExecutorService weatherExecutor = java.util.concurrent.Executors.newSingleThreadExecutor();
-    private LinearLayout weatherPanel;
+    private Bitmap wallpaper;
+    private String wallpaperKey;
+    private final Map<String, Drawable> banners = new LinkedHashMap<String, Drawable>(32, .75f, true) {
+        @Override protected boolean removeEldestEntry(Map.Entry<String, Drawable> entry) { return size() > 32; }
+    };
+    private final ExecutorService weatherExecutor = Executors.newSingleThreadExecutor();
     private WeberinWeather.Reading weatherReading;
-    private String weatherCityLoaded = "";
-    private String weatherCityPending = "";
+    private String weatherCityLoaded = "", weatherCityPending = "";
     private long weatherCheckedAt;
     private int weatherGeneration;
     private boolean weatherFailed;
 
+    @Override protected void attachBaseContext(Context base) { super.attachBaseContext(LauncherLocale.wrap(base)); }
     @Override protected void onCreate(Bundle state) {
         super.onCreate(state);
         preferences = getSharedPreferences(Config.SETTINGS_NAME, MODE_PRIVATE);
-        page = state == null ? 0 : state.getInt("page", 0);
+        page = state == null ? 0 : Math.max(0, Math.min(2, state.getInt("page", 0)));
+        focusedPackage = state == null ? null : state.getString("focused_package");
+        startup = new WeberinStartup(this, this);
         getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_FULLSCREEN
                 | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY);
     }
-
     @Override protected void onResume() {
         super.onResume();
-        if (preferences != null && !preferences.getBoolean("weberin_layout", true)) finish();
-        else if (preferences != null) { loadApps(); render(); }
+        if (!preferences.getBoolean("weberin_layout", true)) { finish(); return; }
+        config = Config.load(this); launch = new WeberinLaunch(this, config); loadApps();
+        if (settingsPanel == null) render(); else settingsPanel.refresh();
+        startup.resume(config);
     }
-
+    @Override protected void onPause() { startup.pause(); super.onPause(); }
     @Override protected void onSaveInstanceState(Bundle out) {
-        out.putInt("page", page);
-        super.onSaveInstanceState(out);
+        out.putInt("page", page); out.putString("focused_package", focusedPackage); super.onSaveInstanceState(out);
     }
-
-    private int dp(float value) { return Math.round(value * getResources().getDisplayMetrics().density); }
-
-    private GradientDrawable shape(int color, int border, int radius) {
-        GradientDrawable d = new GradientDrawable();
-        d.setColor(color);
-        d.setCornerRadius(dp(radius));
-        if (border != 0) d.setStroke(dp(1), border);
-        return d;
-    }
-
-    private TextView label(String text, int size, int color) {
-        TextView view = new TextView(this);
-        view.setText(text);
-        view.setTextColor(color);
-        view.setTextSize(size);
-        view.setGravity(Gravity.CENTER_VERTICAL);
-        return view;
-    }
-
-    private TextView button(String text, Runnable action) {
-        TextView view = label(text, 17, Color.WHITE);
-        view.setGravity(Gravity.CENTER);
-        view.setPadding(dp(18), dp(8), dp(18), dp(8));
-        view.setFocusable(true);
-        view.setOnClickListener(v -> action.run());
-        view.setOnFocusChangeListener((v, focused) -> {
-            view.setTextColor(focused ? Color.BLACK : Color.WHITE);
-            view.setBackground(shape(focused ? Color.WHITE : 0xff101010, focused ? Color.WHITE : 0xff353535, 14));
-        });
-        view.setBackground(shape(0xff101010, 0xff353535, 14));
-        return view;
-    }
+    private TextView text(CharSequence value, int size, int color, boolean bold) { return WeberinUi.text(this, value, size, color, bold); }
+    private void put(FrameLayout parent, View view, int x, int y, int w, int h) { WeberinUi.put(parent, view, x, y, w, h); }
 
     private void loadApps() {
-        PackageManager pm = getPackageManager();
-        Map<String, ResolveInfo> found = new LinkedHashMap<>();
+        Map<String, ResolveInfo> found = new LinkedHashMap<>(); PackageManager pm = getPackageManager();
         for (String category : new String[]{Intent.CATEGORY_LEANBACK_LAUNCHER, Intent.CATEGORY_LAUNCHER}) {
-            Intent query = new Intent(Intent.ACTION_MAIN).addCategory(category);
-            for (ResolveInfo info : pm.queryIntentActivities(query, 0)) {
-                if (!info.activityInfo.packageName.equals(getPackageName()))
-                    found.putIfAbsent(info.activityInfo.packageName, info);
+            for (ResolveInfo app : pm.queryIntentActivities(new Intent(Intent.ACTION_MAIN).addCategory(category), 0)) {
+                if (app.activityInfo == null || !app.activityInfo.exported || !app.activityInfo.enabled
+                        || app.activityInfo.packageName.equals(getPackageName())
+                        || config.libraryExcludedApps.contains(app.activityInfo.packageName)) continue;
+                found.putIfAbsent(app.activityInfo.packageName, app);
             }
         }
-        apps.clear();
-        apps.addAll(found.values());
-        Collections.sort(apps, (a, b) -> String.CASE_INSENSITIVE_ORDER.compare(
-                a.loadLabel(pm).toString(), b.loadLabel(pm).toString()));
+        for (String pkg : config.libraryApps) {
+            Intent intent = pm.getLeanbackLaunchIntentForPackage(pkg);
+            if (intent == null) intent = pm.getLaunchIntentForPackage(pkg);
+            ResolveInfo app = intent == null ? null : pm.resolveActivity(intent, 0);
+            if (app != null && app.activityInfo != null && app.activityInfo.exported
+                    && !config.libraryExcludedApps.contains(pkg) && !pkg.equals(getPackageName())) found.putIfAbsent(pkg, app);
+        }
+        apps.clear(); apps.addAll(found.values());
+        java.text.Collator collator = java.text.Collator.getInstance();
+        Collections.sort(apps, (a, b) -> collator.compare(launch.label(a), launch.label(b)));
     }
 
     private void render() {
-        settingsOverlay = null;
-        weatherPanel = null;
-        FrameLayout root = new FrameLayout(this);
-        root.setBackgroundColor(Color.BLACK);
-        Config config = Config.load(this);
-        activeConfig = config;
-        java.io.File wallpaper = config.wallpaper;
-        if (wallpaper == null && !config.wallpapers.isEmpty()) wallpaper = config.wallpapers.get(0);
-        String selected = preferences.getString("weberin_wallpaper", "01-windows-black-1080p.png");
-        String wallpaperKey = "theme".equals(selected) && wallpaper != null
-                ? "file:" + wallpaper.getAbsolutePath() + ":" + wallpaper.lastModified() + ":" + wallpaper.length()
-                : selected;
-        if (!wallpaperKey.equals(cachedWallpaperKey)) {
-            cachedWallpaper = "theme".equals(selected) && wallpaper != null ? loadWallpaper(wallpaper)
-                    : "none".equals(selected) || "theme".equals(selected) ? null : loadBundledWallpaper(selected);
-            cachedWallpaperKey = wallpaperKey;
+        int tabToRestore = focusedTab;
+        settingsPanel = null; overlay = null; scene = new FrameLayout(this);
+        scene.setClipChildren(false); scene.setBackgroundColor(Color.BLACK);
+        scene.setFocusableInTouchMode(true); scene.requestFocus(); addWallpaper();
+        pageContent = new FrameLayout(this); pageContent.setClipChildren(false);
+        put(scene, pageContent, 0, 0, 1920, 1080); addHeader();
+        setContentView(new WeberinUi.Viewport(this, scene)); populatePage();
+        scene.post(() -> {
+            if (tabToRestore >= 0) tabs[tabToRestore].requestFocus();
+            else if (!restoreCardFocus()) { if (!cards.isEmpty()) cards.get(0).requestFocus(); else tabs[page].requestFocus(); }
+        });
+    }
+
+    private void addWallpaper() {
+        String selected = preferences.getString("weberin_wallpaper", DEFAULT_WALLPAPER);
+        File file = config.wallpaper;
+        if (file == null && !config.wallpapers.isEmpty()) file = config.wallpapers.get(0);
+        String key = "theme".equals(selected) && file != null ? file.getAbsolutePath() + ":" + file.lastModified() + ":" + file.length() : selected;
+        if (!key.equals(wallpaperKey)) { wallpaper = decodeWallpaper(selected, file); wallpaperKey = key; }
+        if (wallpaper != null) {
+            ImageView image = new ImageView(this); image.setImageBitmap(wallpaper); image.setScaleType(ImageView.ScaleType.CENTER_CROP);
+            put(scene, image, 0, 0, 1920, 1080);
         }
-        android.graphics.Bitmap bitmap = cachedWallpaper;
-        if (bitmap != null) {
-            ImageView background = new ImageView(this);
-            background.setImageBitmap(bitmap);
-            background.setScaleType(ImageView.ScaleType.CENTER_CROP);
-            root.addView(background, new FrameLayout.LayoutParams(-1, -1));
+    }
+    private Bitmap decodeWallpaper(String selected, File file) {
+        if (selected == null || "none".equals(selected) || "theme".equals(selected) && file == null) return null;
+        if (!"theme".equals(selected) && (selected.contains("/") || selected.contains(".."))) return null;
+        try {
+            BitmapFactory.Options options = new BitmapFactory.Options(); options.inJustDecodeBounds = true;
+            if ("theme".equals(selected)) BitmapFactory.decodeFile(file.getPath(), options);
+            else try (InputStream input = getAssets().open("weberin/" + selected)) { BitmapFactory.decodeStream(input, null, options); }
+            if (options.outWidth <= 0 || options.outHeight <= 0) return null;
+            android.util.DisplayMetrics metrics = getResources().getDisplayMetrics();
+            options.inSampleSize = WallpaperSize.sampleSize(options.outWidth, options.outHeight, metrics.widthPixels, metrics.heightPixels);
+            if (!WallpaperSize.accepted(options.outWidth / options.inSampleSize, options.outHeight / options.inSampleSize)) return null;
+            options.inJustDecodeBounds = false;
+            if ("theme".equals(selected)) return BitmapFactory.decodeFile(file.getPath(), options);
+            try (InputStream input = getAssets().open("weberin/" + selected)) { return BitmapFactory.decodeStream(input, null, options); }
+        } catch (IOException | RuntimeException | OutOfMemoryError ignored) { return null; }
+    }
+
+    private void addHeader() {
+        TextView brand = text("Weberin", 34, WeberinUi.WHITE, true);
+        brand.setTypeface(WeberinUi.font(this, 700)); brand.setLetterSpacing(-.045f);
+        if (preferences.getBoolean("weberin_show_brand", true)) {
+            put(scene, brand, 96, 67, 133, 42); put(scene, text("TV", 14, WeberinUi.WHITE, true), 229, 86, 25, 20);
         }
-        if (page == 0 && preferences.getBoolean("weberin_show_weather", true)) addWeatherPanel(root);
-        LinearLayout screen = new LinearLayout(this);
-        screen.setOrientation(LinearLayout.VERTICAL);
-        screen.setPadding(dp(40), dp(24), dp(40), dp(24));
-        root.addView(screen, new FrameLayout.LayoutParams(-1, -1));
-        FrameLayout header = new FrameLayout(this);
-        TextView brand = label("WeberinTV", 21, Color.WHITE);
-        android.text.SpannableString brandText = new android.text.SpannableString("WeberinTV");
-        brandText.setSpan(new android.text.style.RelativeSizeSpan(0.48f), 7, 9, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
-        brand.setText(brandText);
-        brand.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
-        header.addView(brand, new FrameLayout.LayoutParams(-2, dp(48), Gravity.START | Gravity.CENTER_VERTICAL));
-        LinearLayout tabs = new LinearLayout(this);
-        tabs.setGravity(Gravity.CENTER);
-        tabs.setPadding(dp(5), dp(4), dp(5), dp(4));
-        tabs.setBackground(shape(0xd9000000, 0xff666666, 18));
-        int[] labels = {R.string.weberin_home, R.string.weberin_apps, R.string.weberin_channels};
-        for (int i = 0; i < labels.length; i++) {
-            final int target = i;
-            TextView tab = label(getString(labels[i]), 15, Color.WHITE);
-            tab.setGravity(Gravity.CENTER);
-            tab.setPadding(dp(14), 0, dp(14), 0);
-            tab.setFocusable(true);
-            tab.setOnClickListener(v -> { page = target; focusedPackage = null; focusSelectedTab = true; render(); });
-            tab.setOnFocusChangeListener((v, focused) -> {
-                boolean active = page == target;
-                tab.setTextColor(active ? Color.BLACK : 0xffeeeeee);
-                tab.setBackground(active ? shape(Color.WHITE, 0, 18) : null);
-                if (focused && page != target) {
-                    tab.post(() -> {
-                        if (!tab.hasFocus() || page == target) return;
-                        page = target;
-                        focusedPackage = null;
-                        focusSelectedTab = true;
-                        render();
-                    });
-                }
+        FrameLayout capsule = new FrameLayout(this);
+        android.graphics.drawable.GradientDrawable shape = new android.graphics.drawable.GradientDrawable(
+                android.graphics.drawable.GradientDrawable.Orientation.TOP_BOTTOM, new int[]{0xff0d0d0d, 0xff030303});
+        shape.setCornerRadius(32); shape.setStroke(1, 0xff858585); capsule.setBackground(shape);
+        put(scene, capsule, 688, 59, 575, 69);
+        int[] names = {R.string.weberin_home, R.string.weberin_apps, R.string.weberin_channels};
+        int[] x = {13, 182, 402}, widths = {132, 185, 160};
+        for (int i = 0; i < 3; i++) {
+            final int target = i; TextView tab = text(getString(names[i]), 22, WeberinUi.WHITE, false);
+            tab.setGravity(Gravity.CENTER); tab.setFocusableInTouchMode(true); tab.setId(View.generateViewId());
+            tab.setOnClickListener(v -> selectPage(target));
+            tab.setOnFocusChangeListener((v, focus) -> { if (focus) { focusedTab = target; selectPage(target); } });
+            tab.setOnKeyListener((v, key, event) -> {
+                if (event.getAction() != KeyEvent.ACTION_DOWN) return false;
+                if (key == KeyEvent.KEYCODE_DPAD_UP) return true;
+                if (key == KeyEvent.KEYCODE_DPAD_LEFT) { tabs[Math.max(0, target - 1)].requestFocus(); return true; }
+                if (key == KeyEvent.KEYCODE_DPAD_RIGHT) { if (target < 2) tabs[target + 1].requestFocus(); else settingsButton.requestFocus(); return true; }
+                if (key == KeyEvent.KEYCODE_DPAD_DOWN) { if (!restoreCardFocus() && !cards.isEmpty()) cards.get(0).requestFocus(); return true; }
+                return false;
             });
-            if (i == page) { tab.setTextColor(Color.BLACK); tab.setBackground(shape(Color.WHITE, 0, 18)); }
-            if (i == page && focusSelectedTab) { tab.post(tab::requestFocus); focusSelectedTab = false; }
-            tabs.addView(tab, new LinearLayout.LayoutParams(-2, dp(36)));
+            tabs[i] = tab; put(capsule, tab, x[i], 9, widths[i], 52);
         }
-        header.addView(tabs, new FrameLayout.LayoutParams(-2, dp(46), Gravity.CENTER));
-        LinearLayout status = new LinearLayout(this);
-        status.setGravity(Gravity.CENTER_VERTICAL);
         if (config.showNetworkPill) {
-            try {
-                android.net.ConnectivityManager network = (android.net.ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
-                android.net.NetworkInfo info = network == null ? null : network.getActiveNetworkInfo();
-                if (info != null && info.isConnected()) {
-                    String networkName = info.getType() == android.net.ConnectivityManager.TYPE_WIFI ? "Wi-Fi" : "Ethernet";
-                    if (info.getType() == android.net.ConnectivityManager.TYPE_WIFI) {
-                        android.net.wifi.WifiManager wifi = (android.net.wifi.WifiManager)
-                                getApplicationContext().getSystemService(WIFI_SERVICE);
-                        android.net.wifi.WifiInfo wifiInfo = wifi == null ? null : wifi.getConnectionInfo();
-                        String ssid = wifiInfo == null ? null : wifiInfo.getSSID();
-                        if (ssid != null) {
-                            ssid = ssid.replace("\"", "").trim();
-                            if (!ssid.isEmpty() && !"<unknown ssid>".equalsIgnoreCase(ssid)) networkName += " · " + ssid;
-                        }
-                    }
-                    TextView networkLabel = label(networkName, 10, 0xffb1b8c7);
-                    networkLabel.setSingleLine(true);
-                    networkLabel.setEllipsize(android.text.TextUtils.TruncateAt.END);
-                    networkLabel.setMaxWidth(dp(130));
-                    networkLabel.setPadding(0, 0, dp(12), 0);
-                    status.addView(networkLabel);
-                }
-            } catch (SecurityException ignored) { }
+            TextView network = text(networkLabel(), 14, WeberinUi.MUTED, false);
+            network.setSingleLine(); network.setEllipsize(TextUtils.TruncateAt.END); network.setFocusable(true);
+            network.setContentDescription(getString(R.string.visibility_network));
+            network.setOnClickListener(v -> openSettingsTarget(new Intent(Settings.ACTION_WIFI_SETTINGS)));
+            network.setOnFocusChangeListener((v, focus) -> network.setBackground(focus ? WeberinUi.round(0x22111111, 0xffcdd3dc, 8) : null));
+            put(scene, network, 1364, 76, 228, 28);
         }
-        ImageView settings = new ImageView(this);
-        settings.setImageResource(R.drawable.ic_settings);
-        settings.setScaleType(ImageView.ScaleType.CENTER);
-        settings.setFocusable(true);
-        settings.setContentDescription(getString(R.string.tv_settings));
-        settings.setOnClickListener(v -> showSettings(root));
-        settings.setOnFocusChangeListener((v, focused) -> settings.setBackground(
-                focused ? shape(0x552f3035, 0xffeeeeee, 10) : null));
-        status.addView(settings, new LinearLayout.LayoutParams(dp(40), dp(44)));
+        settingsButton = new ImageView(this); settingsButton.setFocusableInTouchMode(true); settingsButton.setId(View.generateViewId());
+        settingsButton.setImageResource(R.drawable.ic_settings); settingsButton.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        settingsButton.setPadding(14, 14, 14, 14); settingsButton.setContentDescription(getString(R.string.tv_settings));
+        settingsButton.setOnFocusChangeListener((v, focus) -> { if (focus) focusedTab = -1;
+            settingsButton.setBackground(focus ? WeberinUi.round(0x33151515, 0xffe5e9ee, 12) : null); });
+        settingsButton.setOnClickListener(v -> showSettings());
+        settingsButton.setOnKeyListener((v, key, event) -> {
+            if (event.getAction() != KeyEvent.ACTION_DOWN) return false;
+            if (key == KeyEvent.KEYCODE_DPAD_LEFT) { tabs[2].requestFocus(); return true; }
+            if (key == KeyEvent.KEYCODE_DPAD_DOWN) { if (!restoreCardFocus() && !cards.isEmpty()) cards.get(cards.size() - 1).requestFocus(); return true; }
+            return key == KeyEvent.KEYCODE_DPAD_UP || key == KeyEvent.KEYCODE_DPAD_RIGHT;
+        });
+        put(scene, settingsButton, 1616, 64, 48, 48);
         if (preferences.getBoolean("weberin_show_clock", true)) {
-            LinearLayout clockBlock = new LinearLayout(this);
-            clockBlock.setPadding(dp(14), 0, 0, 0);
-            clockBlock.setOrientation(LinearLayout.VERTICAL);
-            TextClock clock = new TextClock(this);
-            clock.setFormat24Hour("HH:mm");
-            clock.setFormat12Hour("h:mm a");
-            clock.setTextColor(Color.WHITE);
-            clock.setTextSize(21);
-            clockBlock.addView(clock);
-            TextClock date = new TextClock(this);
-            date.setFormat12Hour("EEE, d MMMM");
-            date.setFormat24Hour("EEE, d MMMM");
-            date.setTextColor(0xffaeb6c5);
-            date.setTextSize(10);
-            clockBlock.addView(date);
-            ClockFormat.apply(clockBlock, config.clockFormat);
-            status.addView(clockBlock);
-        }
-        header.addView(status, new FrameLayout.LayoutParams(-2, dp(48), Gravity.END | Gravity.CENTER_VERTICAL));
-        screen.addView(header, new LinearLayout.LayoutParams(-1, dp(48)));
-        content = new LinearLayout(this);
-        content.setOrientation(LinearLayout.VERTICAL);
-        screen.addView(content, new LinearLayout.LayoutParams(-1, 0, 1));
-        setContentView(root);
-        if (page == 2) {
-            TextView empty = label(getString(R.string.weberin_channels_later), 22, 0xffb8bdc8);
-            empty.setGravity(Gravity.CENTER);
-            content.addView(empty, new LinearLayout.LayoutParams(-1, -1));
-        } else if (page == 0 && !preferences.getBoolean("weberin_show_favorites", true)) {
-            // A deliberately empty home leaves the wallpaper visible. Navigation stays available.
-        } else if (page == 0) {
-            View space = new View(this);
-            content.addView(space, new LinearLayout.LayoutParams(1, 0, 1));
-            LinearLayout panel = new LinearLayout(this);
-            panel.setOrientation(LinearLayout.VERTICAL);
-            panel.setPadding(dp(16), dp(8), dp(16), dp(8));
-            int opacity = preferences.contains(Config.DOCK_OPACITY_KEY)
-                    ? preferences.getInt(Config.DOCK_OPACITY_KEY, 60) : 60;
-            opacity = Math.max(30, Math.min(100, opacity));
-            panel.setBackground(shape((opacity * 255 / 100) << 24, 0x665f626b, 20));
-            LinearLayout titleRow = new LinearLayout(this);
-            titleRow.setGravity(Gravity.CENTER_VERTICAL);
-            TextView title = label(getString(R.string.weberin_my_apps), 19, Color.WHITE);
-            title.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
-            titleRow.addView(title, new LinearLayout.LayoutParams(0, dp(38), 1));
-            TextView hint = label(getString(R.string.weberin_hold_hint), 11, 0xffb1b8c7);
-            titleRow.addView(hint);
-            panel.addView(titleRow);
-            HorizontalScrollView scroll = new HorizontalScrollView(this);
-            scroll.setHorizontalScrollBarEnabled(false);
-            scroll.setClipChildren(false);
-            LinearLayout row = new LinearLayout(this);
-            row.setClipChildren(false);
-            for (ResolveInfo app : favorites()) row.addView(tile(app));
-            row.addView(allAppsTile());
-            if (initialFocus && row.getChildCount() > 0) {
-                initialFocus = false;
-                View first = row.getChildAt(0);
-                first.post(first::requestFocus);
-            }
-            scroll.addView(row);
-            panel.addView(scroll);
-            content.addView(panel);
-        } else {
-            addTitle(R.string.weberin_apps);
-            ScrollView scroll = new ScrollView(this);
-            scroll.setPadding(dp(12), dp(8), dp(12), dp(8));
-            scroll.setBackground(shape(0x99000000, 0x665f626b, 20));
-            GridLayout grid = new GridLayout(this);
-            int columns = preferences.contains("columns") ? Config.load(this).columns : 5;
-            grid.setColumnCount(Math.max(4, Math.min(7, columns)));
-            for (ResolveInfo app : apps) grid.addView(tile(app));
-            if (apps.isEmpty()) grid.addView(label(getString(R.string.weberin_no_apps), 18, Color.WHITE));
-            scroll.addView(grid);
-            content.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1));
+            View divider = new View(this); divider.setBackgroundColor(0xff141414); put(scene, divider, 1676, 64, 1, 48);
+            TextClock clock = new TextClock(this); clock.setTextSize(TypedValue.COMPLEX_UNIT_PX, 32);
+            clock.setTextColor(WeberinUi.WHITE); clock.setIncludeFontPadding(false); clock.setGravity(Gravity.CENTER_VERTICAL);
+            clock.setTypeface(WeberinUi.font(this, 400));
+            clock.setFormat12Hour("h:mm"); clock.setFormat24Hour("HH:mm"); put(scene, clock, 1700, 58, 176, 40);
+            TextClock date = new TextClock(this); date.setTextSize(TypedValue.COMPLEX_UNIT_PX, 14);
+            date.setTextColor(WeberinUi.MUTED); date.setIncludeFontPadding(false);
+            date.setTypeface(WeberinUi.font(this, 400));
+            date.setFormat12Hour("EEEE, d MMMM"); date.setFormat24Hour("EEEE, d MMMM");
+            date.setTransformationMethod(new android.text.method.TransformationMethod() {
+                @Override public CharSequence getTransformation(CharSequence source, View view) {
+                    if (TextUtils.isEmpty(source)) return source;
+                    return source.subSequence(0, 1).toString().toUpperCase(Locale.getDefault()) + source.subSequence(1, source.length());
+                }
+                @Override public void onFocusChanged(View view, CharSequence source, boolean focus, int direction, android.graphics.Rect previous) { }
+            });
+            if (preferences.getBoolean("weberin_show_date", true)) put(scene, date, 1700, 98, 210, 20);
+            ClockFormat.apply(clock, config.clockFormat);
         }
     }
-
-    private android.graphics.Bitmap loadBundledWallpaper(String name) {
-        if (name.contains("/") || name.contains("..")) {
-            return null;
-        }
+    private String networkLabel() {
         try {
-            android.graphics.BitmapFactory.Options options = new android.graphics.BitmapFactory.Options();
-            options.inJustDecodeBounds = true;
-            try (java.io.InputStream input = getAssets().open("weberin/" + name)) {
-                android.graphics.BitmapFactory.decodeStream(input, null, options);
-            }
-            if (options.outWidth <= 0 || options.outHeight <= 0) return null;
-            android.util.DisplayMetrics metrics = getResources().getDisplayMetrics();
-            options.inSampleSize = WallpaperSize.sampleSize(options.outWidth, options.outHeight,
-                    metrics.widthPixels, metrics.heightPixels);
-            if (!WallpaperSize.accepted(options.outWidth / options.inSampleSize,
-                    options.outHeight / options.inSampleSize)) return null;
-            options.inJustDecodeBounds = false;
-            try (java.io.InputStream input = getAssets().open("weberin/" + name)) {
-                return android.graphics.BitmapFactory.decodeStream(input, null, options);
-            }
-        } catch (java.io.IOException | OutOfMemoryError failure) { return null; }
+            ConnectivityManager manager = (ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
+            NetworkInfo network = manager == null ? null : manager.getActiveNetworkInfo();
+            if (network == null || !network.isConnected()) return getString(R.string.weberin_network_offline);
+            if (network.getType() != ConnectivityManager.TYPE_WIFI) return network.getTypeName();
+            String label = "Wi-Fi";
+            android.net.wifi.WifiManager wifi = (android.net.wifi.WifiManager) getApplicationContext().getSystemService(WIFI_SERVICE);
+            android.net.wifi.WifiInfo info = wifi == null ? null : wifi.getConnectionInfo(); String ssid = info == null ? null : info.getSSID();
+            if (ssid != null && !"<unknown ssid>".equalsIgnoreCase(ssid)) { ssid = ssid.replace("\"", "").trim(); if (!ssid.isEmpty()) label += " · " + ssid; }
+            return label;
+        } catch (SecurityException ignored) { return "Wi-Fi"; }
     }
-
-    /** Decode only the chosen image, sampling it to the display rather than always allocating a 4K bitmap. */
-    private android.graphics.Bitmap loadWallpaper(java.io.File file) {
-        try {
-            android.graphics.BitmapFactory.Options options = new android.graphics.BitmapFactory.Options();
-            options.inJustDecodeBounds = true;
-            android.graphics.BitmapFactory.decodeFile(file.getPath(), options);
-            if (options.outWidth <= 0 || options.outHeight <= 0) return null;
-            android.util.DisplayMetrics metrics = getResources().getDisplayMetrics();
-            options.inSampleSize = WallpaperSize.sampleSize(options.outWidth, options.outHeight,
-                    metrics.widthPixels, metrics.heightPixels);
-            if (!WallpaperSize.accepted(options.outWidth / options.inSampleSize,
-                    options.outHeight / options.inSampleSize)) return null;
-            options.inJustDecodeBounds = false;
-            return android.graphics.BitmapFactory.decodeFile(file.getPath(), options);
-        } catch (Exception | OutOfMemoryError failure) {
-            return null;
+    private void selectPage(int target) { if (page != target) { page = target; focusedPackage = null; populatePage(); } updateTabs(); }
+    private void updateTabs() {
+        for (int i = 0; i < tabs.length; i++) if (tabs[i] != null) {
+            tabs[i].setTextColor(i == page ? 0xff202023 : 0xffdddddf);
+            tabs[i].setTypeface(WeberinUi.font(this, i == page ? 600 : 500));
+            tabs[i].setBackground(i == page ? WeberinUi.round(0xfff5f5f7, 0, 27) : null);
         }
     }
-
-    private void addTitle(int title) {
-        TextView label = label(getString(title), 22, Color.WHITE);
-        label.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
-        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, dp(52));
-        params.topMargin = dp(20);
-        content.addView(label, params);
+    private void populatePage() {
+        pageContent.removeAllViews(); cards.clear(); weatherPanel = null; homeAction = null;
+        if (page == 0) {
+            if (preferences.getBoolean("weberin_home_full", false)) addFullHome();
+            if (preferences.getBoolean("weberin_show_weather", preferences.getBoolean("weberin_home_full", false))) addWeatherPanel();
+            if (preferences.getBoolean("weberin_show_favorites", config.dockRow)) addDock();
+        } else if (page == 1) addAppGrid();
+        else { TextView empty = text(getString(R.string.weberin_channels_later), 28, WeberinUi.MUTED, false);
+            empty.setGravity(Gravity.CENTER); put(pageContent, empty, 460, 440, 1000, 100); }
+        updateTabs();
     }
+    private int surfaceOpacity() { return preferences.contains(Config.DOCK_OPACITY_KEY) ? Math.max(0, Math.min(255, config.dockOpacity * 255 / 100)) : 20; }
+    private void addDock() {
+        FrameLayout panel = new FrameLayout(this); panel.setClipChildren(false);
+        panel.setBackground(new WeberinUi.Surface(preferences.getBoolean("weberin_surface_tint", false), surfaceOpacity()));
+        put(pageContent, panel, 60, 716, 1784, 304);
+        put(panel, text(getString(R.string.weberin_my_apps), 26, WeberinUi.WHITE, true), 32, 28, 700, 36);
+        TextView hint = text(getString(R.string.weberin_hold_hint), 16, WeberinUi.MUTED, false); hint.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
+        if (preferences.getBoolean("weberin_show_hints", true)) put(panel, hint, 1050, 30, 702, 30);
+        HorizontalScrollView scroll = new HorizontalScrollView(this); scroll.setHorizontalScrollBarEnabled(false);
+        scroll.setClipChildren(false); scroll.setClipToPadding(false); put(panel, scroll, 24, 74, 1736, 214);
+        FrameLayout row = new FrameLayout(this); row.setClipChildren(false); List<ResolveInfo> favorites = favorites();
+        scroll.addView(row, new ScrollView.LayoutParams(Math.max(1736, (favorites.size() + 1) * 290 - 4), 214));
+        for (int i = 0; i < favorites.size(); i++) put(row, tile(favorites.get(i), 270, 156), i * 290, 0, 286, 214);
+        put(row, allAppsTile(), favorites.size() * 290, 0, 286, 214); wireCards(0);
+    }
+    private void addAppGrid() {
+        put(pageContent, text(getString(R.string.weberin_apps), 26, WeberinUi.WHITE, true), 96, 197, 800, 38);
+        FrameLayout panel = new FrameLayout(this); panel.setBackground(new WeberinUi.Surface(preferences.getBoolean("weberin_surface_tint", false), surfaceOpacity()));
+        put(pageContent, panel, 60, 245, 1800, 750);
+        ScrollView scroll = new ScrollView(this); scroll.setVerticalScrollBarEnabled(false); scroll.setClipToPadding(true); scroll.setPadding(0, 0, 0, 12);
+        put(panel, scroll, 0, 10, 1800, 730); FrameLayout grid = new FrameLayout(this); grid.setClipChildren(false);
+        int columns = WeberinGeometry.columns(preferences.contains("columns") ? config.columns : 5);
+        int width = WeberinGeometry.gridCardWidth(columns), height = Math.round(width * 156f / 270);
+        List<ResolveInfo> ordered = orderedApps();
+        int stepY = columns <= 5 ? 245 : height + 89, rowCount = Math.max(1, (ordered.size() + columns - 1) / columns);
+        scroll.addView(grid, new ScrollView.LayoutParams(1800, Math.max(718, rowCount * stepY)));
+        for (int i = 0; i < ordered.size(); i++) put(grid, tile(ordered.get(i), width, height),
+                WeberinGeometry.gridX(i % columns, columns) - 8, 7 + i / columns * stepY, width + 16, height + 58);
+        if (ordered.isEmpty()) put(grid, text(getString(R.string.weberin_no_apps), 24, WeberinUi.MUTED, false), 36, 38, 1200, 50);
+        wireCards(columns);
+    }
+    private FrameLayout tile(ResolveInfo app, int width, int height) {
+        String name = launch.label(app), pkg = app.activityInfo.packageName;
+        String captionName = pkg.startsWith("ru.okko") && name.equals("okko") ? "Okko" : name;
+        FrameLayout holder = new FrameLayout(this); holder.setClipChildren(false);
+        FrameLayout button = new WeberinUi.CardButton(this); button.setClipChildren(false); button.setFocusableInTouchMode(true);
+        button.setId(View.generateViewId()); button.setTag(pkg); button.setContentDescription(name); put(holder, button, 0, 0, width + 16, height + 16);
+        FrameLayout face = new FrameLayout(this); face.setBackground(WeberinUi.round(0x660e0e0e, 0x22aaaaaa, 20));
+        face.setClipToOutline(true); put(button, face, 8, 8, width, height); Drawable banner = null;
+        if (preferences.getBoolean("weberin_native_banners", false) || config.appBanners.containsKey(pkg)) {
+            banner = banners.get(pkg); if (banner == null) { banner = launch.banner(app); if (banner != null) banners.put(pkg, banner); }
+        }
+        if (banner != null) { ImageView art = new ImageView(this); art.setImageDrawable(banner); art.setScaleType(ImageView.ScaleType.FIT_CENTER); put(face, art, 0, 0, width, height); }
+        else put(face, new WeberinArtwork(this, pkg, name), 0, 0, width, height);
+        TextView caption = text(captionName, 18, WeberinUi.MUTED, false); caption.setGravity(Gravity.CENTER); caption.setSingleLine(); caption.setEllipsize(TextUtils.TruncateAt.END);
+        put(holder, caption, 4, height + 22, width + 8, 26);
+        if (!preferences.getBoolean("weberin_show_app_names", true)) caption.setVisibility(View.INVISIBLE);
+        button.setOnFocusChangeListener((v, focus) -> { focusCard(button, caption, focus); if (focus) { focusedPackage = pkg; focusedTab = -1; } });
+        button.setOnClickListener(v -> launch.open(app)); button.setOnLongClickListener(v -> { showTileMenu(app); return true; }); cards.add(button); return holder;
+    }
+    private View allAppsTile() {
+        FrameLayout holder = new FrameLayout(this), button = new WeberinUi.CardButton(this);
+        button.setFocusableInTouchMode(true); button.setId(View.generateViewId()); button.setTag("@all"); button.setContentDescription(getString(R.string.weberin_all_apps));
+        put(holder, button, 0, 0, 286, 172); FrameLayout face = new FrameLayout(this);
+        face.setBackground(WeberinUi.round(0x990d0d0d, 0x22aaaaaa, 20)); put(button, face, 8, 8, 270, 156);
+        put(face, new WeberinUi.AppsIcon(this), 108, 61, 54, 34);
+        TextView caption = text(getString(R.string.weberin_all_short), 18, WeberinUi.MUTED, false); caption.setGravity(Gravity.CENTER); put(holder, caption, 0, 178, 286, 26);
+        if (!preferences.getBoolean("weberin_show_app_names", true)) caption.setVisibility(View.INVISIBLE);
+        button.setOnFocusChangeListener((v, focus) -> { focusCard(button, caption, focus); if (focus) { focusedPackage = "@all"; focusedTab = -1; } });
+        button.setOnClickListener(v -> { focusedTab = -1; selectPage(1); if (!cards.isEmpty()) cards.get(0).requestFocus(); });
+        button.setOnLongClickListener(v -> { showSettings(); return true; }); cards.add(button); return holder;
+    }
+    private void focusCard(View button, TextView caption, boolean focus) {
+        android.graphics.drawable.GradientDrawable outline = WeberinUi.round(Color.TRANSPARENT, 0, 25); if (focus) outline.setStroke(2, 0xffdce6eb);
+        button.setBackground(focus ? outline : null); caption.setTextColor(focus ? WeberinUi.WHITE : WeberinUi.MUTED);
+        caption.setTypeface(WeberinUi.font(this, focus ? 600 : 400));
+    }
+    private void wireCards(int columns) {
+        for (int i = 0; i < cards.size(); i++) {
+            final int index = i; cards.get(i).setOnKeyListener((v, key, event) -> {
+                if (event.getAction() != KeyEvent.ACTION_DOWN) return false;
+                int direction = key == KeyEvent.KEYCODE_DPAD_LEFT ? -1 : key == KeyEvent.KEYCODE_DPAD_RIGHT ? 1 : key == KeyEvent.KEYCODE_DPAD_UP ? -2 : key == KeyEvent.KEYCODE_DPAD_DOWN ? 2 : 0;
+                if (direction == 0) return false;
+                if (columns == 0) { if (direction == -2) { if (homeAction != null && index < 2) homeAction.requestFocus(); else tabs[page].requestFocus(); }
+                    else if (Math.abs(direction) == 1) cards.get(Math.max(0, Math.min(cards.size() - 1, index + direction))).requestFocus(); }
+                else { int next = WeberinGeometry.neighbour(index, direction, columns, cards.size()); if (next < 0) tabs[page].requestFocus(); else cards.get(next).requestFocus(); }
+                return true;
+            });
+        }
+    }
+    private boolean restoreCardFocus() { if (focusedPackage == null) return false; for (View card : cards) if (focusedPackage.equals(card.getTag())) return card.requestFocus(); return false; }
 
     private List<ResolveInfo> favorites() {
-        Set<String> saved = preferences.getStringSet(FAVORITES, null);
-        List<ResolveInfo> result = new ArrayList<>();
-        if (saved != null) {
-            for (ResolveInfo app : apps) if (saved.contains(app.activityInfo.packageName)) result.add(app);
-            return orderedFavorites(result);
-        }
-        // Prefer recognizable TV apps; never fill the dock with vendor services just because they sort first.
-        String[] preferred = {"com.google.android.youtube.tv", "com.netflix.ninja", "com.amazon.amazonvideo.livingroom",
-                "ru.kinopoisk.tv", "ru.ivi.client", "ru.okko"};
-        for (String pkg : preferred) {
-            for (ResolveInfo app : apps) {
-                if (pkg.equals(app.activityInfo.packageName) && result.size() < 5) result.add(app);
+        List<ResolveInfo> result = new ArrayList<>(); Set<String> saved = preferences.getStringSet(FAVORITES, null);
+        if (saved != null) { for (ResolveInfo app : apps) if (saved.contains(app.activityInfo.packageName)) result.add(app); }
+        else {
+            Set<String> removed = LibraryApps.loadRemoved(this);
+            Order originalOrder = Order.load(Order.file(this));
+            List<String> defaults = new ArrayList<>();
+            int limit = Math.max(5, config.dockApps.size());
+            if (originalOrder != null && originalOrder.dock.equals(Order.dockKey(config.dockApps))) {
+                int docked = originalOrder.docked >= 0 ? originalOrder.docked : Math.min(config.columns, originalOrder.keys.size());
+                limit = Math.max(limit, docked);
+                for (int i = 0; i < Math.min(docked, originalOrder.keys.size()); i++) {
+                    android.content.ComponentName component = android.content.ComponentName.unflattenFromString(originalOrder.keys.get(i));
+                    if (component != null) defaults.add(component.getPackageName());
+                }
             }
+            defaults.addAll(config.dockApps); defaults.addAll(new java.util.TreeSet<>(LibraryApps.load(this)));
+            Collections.addAll(defaults, "com.google.android.youtube.tv", "com.happproxy", "com.happproxy.tv", "ru.kinopoisk.tv", "ru.ivi.client", "ru.okko");
+            for (String pkg : defaults) for (ResolveInfo app : apps) { if (result.size() >= limit) break;
+                if (app.activityInfo.packageName.equals(pkg) && !removed.contains(pkg) && !config.hiddenApps.contains(pkg) && !result.contains(app)) result.add(app); }
+            for (ResolveInfo app : apps) { if (result.size() >= limit) break;
+                if ((app.activityInfo.applicationInfo.flags & ApplicationInfo.FLAG_SYSTEM) == 0 && !config.hiddenApps.contains(app.activityInfo.packageName)
+                        && !removed.contains(app.activityInfo.packageName) && !result.contains(app)) result.add(app); }
         }
-        for (ResolveInfo app : apps) {
-            if (result.size() >= 5) break;
-            int flags = app.activityInfo.applicationInfo.flags;
-            if ((flags & android.content.pm.ApplicationInfo.FLAG_SYSTEM) == 0 && !result.contains(app)) result.add(app);
-        }
-        return orderedFavorites(result);
-    }
-
-    private List<ResolveInfo> orderedFavorites(List<ResolveInfo> result) {
         List<String> order = new ArrayList<>();
-        try {
-            org.json.JSONArray json = new org.json.JSONArray(preferences.getString("weberin_favorites_order", "[]"));
-            for (int i = 0; i < json.length(); i++) order.add(json.getString(i));
-        } catch (org.json.JSONException ignored) { }
-        java.util.Collections.sort(result, (a, b) -> {
-            int left = order.indexOf(a.activityInfo.packageName);
-            int right = order.indexOf(b.activityInfo.packageName);
-            return Integer.compare(left < 0 ? Integer.MAX_VALUE : left, right < 0 ? Integer.MAX_VALUE : right);
-        });
+        try { org.json.JSONArray json = new org.json.JSONArray(preferences.getString(FAVORITE_ORDER, "[]")); for (int i = 0; i < json.length(); i++) order.add(json.getString(i)); } catch (org.json.JSONException ignored) { }
+        if (!order.isEmpty()) Collections.sort(result, (a, b) -> Integer.compare(rank(order, a), rank(order, b)));
+        else if (saved == null) {
+            Map<String, Integer> ranks = Order.ranks(Order.load(Order.file(this)), config.dockApps);
+            Collections.sort(result, (a, b) -> Order.compare(ranks, new android.content.ComponentName(a.activityInfo.packageName, a.activityInfo.name).flattenToShortString(),
+                    new android.content.ComponentName(b.activityInfo.packageName, b.activityInfo.name).flattenToShortString()));
+        }
         return result;
     }
-
+    private int rank(List<String> order, ResolveInfo app) { int index = order.indexOf(app.activityInfo.packageName); return index < 0 ? Integer.MAX_VALUE : index; }
+    private List<ResolveInfo> orderedApps() {
+        List<ResolveInfo> ordered = new ArrayList<>(favorites()), remaining = new ArrayList<>();
+        for (ResolveInfo app : apps) if (!ordered.contains(app)) remaining.add(app);
+        Map<String, Integer> original = Order.ranks(Order.load(Order.file(this)), config.dockApps);
+        Collections.sort(remaining, (a, b) -> {
+            int saved = Order.compare(original,
+                    new android.content.ComponentName(a.activityInfo.packageName, a.activityInfo.name).flattenToShortString(),
+                    new android.content.ComponentName(b.activityInfo.packageName, b.activityInfo.name).flattenToShortString());
+            return saved != 0 ? saved : Integer.compare(artworkOrder(a), artworkOrder(b));
+        });
+        ordered.addAll(remaining);
+        List<String> custom = new ArrayList<>();
+        try { org.json.JSONArray json = new org.json.JSONArray(preferences.getString("weberin_grid_order", "[]"));
+            for (int i = 0; i < json.length(); i++) custom.add(json.getString(i));
+        } catch (org.json.JSONException ignored) { }
+        if (!custom.isEmpty()) Collections.sort(ordered, (a, b) -> Integer.compare(rank(custom, a), rank(custom, b)));
+        return ordered;
+    }
+    private int artworkOrder(ResolveInfo app) {
+        String name = launch.label(app).toLowerCase(Locale.ROOT).replace(" ", "");
+        String[] names = {"vkвидео", "wink", "start", "premier", "kion", "триколор", "spotify", "браузер", "файлы", "настройки"};
+        for (int i = 0; i < names.length; i++) if (name.equals(names[i])) return i;
+        return names.length;
+    }
+    private void moveGridApp(List<ResolveInfo> ordered, int from, int to) {
+        Collections.swap(ordered, from, to); org.json.JSONArray json = new org.json.JSONArray();
+        for (ResolveInfo app : ordered) json.put(app.activityInfo.packageName);
+        preferences.edit().putString("weberin_grid_order", json.toString()).apply(); populatePage(); focusNearest(to);
+    }
     private void showTileMenu(ResolveInfo app) {
-        String pkg = app.activityInfo.packageName;
-        List<ResolveInfo> current = favorites();
-        int position = -1;
-        for (int i = 0; i < current.size(); i++) {
-            if (pkg.equals(current.get(i).activityInfo.packageName)) { position = i; break; }
+        String pkg = app.activityInfo.packageName; List<ResolveInfo> current = favorites(); int found = -1;
+        for (int i = 0; i < current.size(); i++) if (pkg.equals(current.get(i).activityInfo.packageName)) found = i;
+        final int index = found; List<String> labels = new ArrayList<>(); List<Runnable> actions = new ArrayList<>();
+        labels.add(getString(index >= 0 ? R.string.library_remove_shortcut : R.string.library_add_home));
+        actions.add(() -> { Set<String> next = new HashSet<>(); for (ResolveInfo favorite : current) next.add(favorite.activityInfo.packageName);
+            if (index >= 0) { next.remove(pkg); current.remove(index); } else { next.add(pkg); current.add(app); }
+            saveFavorites(current, next); populatePage(); focusNearest(index); });
+        if (page == 1) {
+            List<ResolveInfo> grid = orderedApps(); int position = grid.indexOf(app);
+            if (position > 0) { labels.add(getString(R.string.weberin_move_left)); actions.add(() -> moveGridApp(grid, position, position - 1)); }
+            if (position >= 0 && position + 1 < grid.size()) { labels.add(getString(R.string.weberin_move_right)); actions.add(() -> moveGridApp(grid, position, position + 1)); }
+        } else {
+            if (index > 0) { labels.add(getString(R.string.weberin_move_left)); actions.add(() -> moveFavorite(current, index, index - 1)); }
+            if (index >= 0 && index + 1 < current.size()) { labels.add(getString(R.string.weberin_move_right)); actions.add(() -> moveFavorite(current, index, index + 1)); }
         }
-        final int index = position;
-        List<String> choices = new ArrayList<>();
-        List<Runnable> actions = new ArrayList<>();
-        choices.add(getString(index >= 0 ? R.string.library_remove_shortcut : R.string.library_add_home));
-        actions.add(() -> {
-            Set<String> next = new HashSet<>();
-            for (ResolveInfo favorite : current) next.add(favorite.activityInfo.packageName);
-            if (index >= 0) next.remove(pkg); else next.add(pkg);
-            preferences.edit().putStringSet(FAVORITES, next).apply();
-            if (page == 0) render();
-        });
-        if (index > 0) {
-            choices.add(getString(R.string.weberin_move_left));
-            actions.add(() -> moveFavorite(current, index, index - 1));
-        }
-        if (index >= 0 && index < current.size() - 1) {
-            choices.add(getString(R.string.weberin_move_right));
-            actions.add(() -> moveFavorite(current, index, index + 1));
-        }
-        choices.add(getString(R.string.library_app_info));
-        actions.add(() -> openSettingsTarget(new Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                android.net.Uri.parse("package:" + pkg))));
-        new android.app.AlertDialog.Builder(this).setTitle(app.loadLabel(getPackageManager()))
-                .setItems(choices.toArray(new String[0]), (dialog, which) -> actions.get(which).run())
-                .setNegativeButton(android.R.string.cancel, null).show();
+        labels.add(getString(R.string.library_app_info)); actions.add(() -> openSettingsTarget(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, android.net.Uri.parse("package:" + pkg))));
+        new AlertDialog.Builder(this).setTitle(launch.label(app)).setItems(labels.toArray(new String[0]), (dialog, which) -> actions.get(which).run()).setNegativeButton(android.R.string.cancel, null).show();
     }
-
+    private void saveFavorites(List<ResolveInfo> order, Set<String> selected) {
+        org.json.JSONArray json = new org.json.JSONArray(); for (ResolveInfo app : order) json.put(app.activityInfo.packageName);
+        preferences.edit().putStringSet(FAVORITES, selected).putString(FAVORITE_ORDER, json.toString()).apply();
+    }
     private void moveFavorite(List<ResolveInfo> current, int from, int to) {
-        java.util.Collections.swap(current, from, to);
-        org.json.JSONArray order = new org.json.JSONArray();
-        for (ResolveInfo favorite : current) order.put(favorite.activityInfo.packageName);
-        preferences.edit().putString("weberin_favorites_order", order.toString()).apply();
-        render();
+        Collections.swap(current, from, to); Set<String> selected = new HashSet<>(); for (ResolveInfo app : current) selected.add(app.activityInfo.packageName);
+        saveFavorites(current, selected); populatePage(); focusNearest(to);
     }
+    private void focusNearest(int previous) { pageContent.post(() -> { if (!restoreCardFocus() && !cards.isEmpty()) cards.get(Math.max(0, Math.min(cards.size() - 1, previous))).requestFocus(); }); }
 
-    @Override public void onBackPressed() {
-        if (settingsOverlay != null) {
-            settingsOverlay = null;
-            render();
-        } else {
-            super.onBackPressed();
+    private void addFullHome() {
+        if (preferences.getBoolean("weberin_show_news", true)) {
+        TextView eyebrow = text(getString(R.string.weberin_home_eyebrow), 16, 0xffa9b0bb, true); eyebrow.setLetterSpacing(.10f); put(pageContent, eyebrow, 96, 222, 950, 28);
+        TextView title = text(getString(R.string.weberin_new_releases), 76, WeberinUi.WHITE, true); title.setTypeface(WeberinUi.font(this, 700)); put(pageContent, title, 96, 263, 1000, 92);
+        // The artwork's films are examples. The owner has not chosen a content source yet.
+        put(pageContent, text(getString(R.string.weberin_news_source_missing), 24, WeberinUi.MUTED, false), 96, 382, 1000, 64);
         }
-    }
-
-    private void showSettings(FrameLayout root) {
-        FrameLayout overlay = new FrameLayout(this);
-        settingsOverlay = overlay;
-        overlay.setBackgroundColor(0x99000000);
-        overlay.setFocusable(true);
-        overlay.setOnKeyListener((v, key, event) -> {
-            if (key == android.view.KeyEvent.KEYCODE_BACK && event.getAction() == android.view.KeyEvent.ACTION_UP) {
-                settingsOverlay = null;
-                render();
-                return true;
-            }
-            return false;
-        });
-        root.addView(overlay, new FrameLayout.LayoutParams(-1, -1));
-        LinearLayout sidebar = new LinearLayout(this);
-        sidebar.setOrientation(LinearLayout.VERTICAL);
-        sidebar.setPadding(dp(12), dp(20), dp(12), dp(16));
-        sidebar.setBackground(shape(0xff09090a, 0xff777777, 20));
-        FrameLayout.LayoutParams sideParams = new FrameLayout.LayoutParams(dp(165), -1, Gravity.END);
-        sideParams.setMargins(0, dp(18), dp(18), dp(18));
-        overlay.addView(sidebar, sideParams);
-        LinearLayout sidebarHeader = new LinearLayout(this);
-        sidebarHeader.setGravity(Gravity.CENTER_VERTICAL);
-        sidebarHeader.setPadding(dp(10), 0, dp(4), 0);
-        ImageView gear = new ImageView(this);
-        gear.setImageResource(R.drawable.ic_settings);
-        gear.setScaleType(ImageView.ScaleType.CENTER);
-        sidebarHeader.addView(gear, new LinearLayout.LayoutParams(dp(28), dp(40)));
-        View divider = new View(this);
-        divider.setBackgroundColor(0xff29292b);
-        LinearLayout.LayoutParams dividerParams = new LinearLayout.LayoutParams(dp(1), dp(32));
-        dividerParams.setMargins(dp(8), 0, dp(10), 0);
-        sidebarHeader.addView(divider, dividerParams);
-        LinearLayout sidebarClock = new LinearLayout(this);
-        sidebarClock.setOrientation(LinearLayout.VERTICAL);
-        TextClock time = new TextClock(this);
-        time.setFormat24Hour("HH:mm"); time.setFormat12Hour("h:mm a");
-        time.setTextColor(Color.WHITE); time.setTextSize(22);
-        sidebarClock.addView(time);
-        TextClock sidebarDate = new TextClock(this);
-        sidebarDate.setFormat24Hour("EEEE, d MMMM"); sidebarDate.setFormat12Hour("EEEE, d MMMM");
-        sidebarDate.setTextColor(0xffbfc6d3); sidebarDate.setTextSize(9);
-        sidebarClock.addView(sidebarDate);
-        ClockFormat.apply(sidebarClock, Config.load(this).clockFormat);
-        sidebarHeader.addView(sidebarClock, new LinearLayout.LayoutParams(0, -2, 1));
-        sidebar.addView(sidebarHeader, new LinearLayout.LayoutParams(-1, dp(54)));
-        LinearLayout details = new LinearLayout(this);
-        details.setOrientation(LinearLayout.VERTICAL);
-        details.setPadding(dp(20), dp(18), dp(20), dp(18));
-        details.setBackground(shape(0xff09090a, 0xff777777, 20));
-        FrameLayout.LayoutParams detailParams = new FrameLayout.LayoutParams(dp(330), -1, Gravity.END);
-        detailParams.setMargins(0, dp(18), dp(200), dp(18));
-        overlay.addView(details, detailParams);
-        settingsCategoryRows.clear();
-        settingsCategory = 0;
-        int[] categories = {R.string.weberin_settings_apps, R.string.weberin_settings_system,
-                R.string.weberin_settings_display, R.string.weberin_settings_sound,
-                R.string.weberin_settings_themes, R.string.weberin_settings_other};
-        for (int i = 0; i < categories.length; i++) {
-            final int category = i;
-            TextView item = label(getString(categories[i]), 16, Color.WHITE);
-            item.setGravity(Gravity.CENTER);
-            item.setFocusable(true);
-            item.setBackground(shape(0x00111111, 0, 9));
-            item.setOnFocusChangeListener((v, focused) -> {
-                if (focused) {
-                    settingsCategory = category;
-                    fillSettings(details, category);
-                }
-                for (int j = 0; j < settingsCategoryRows.size(); j++) {
-                    TextView choice = settingsCategoryRows.get(j);
-                    choice.setBackground(shape(0x00111111, j == settingsCategory ? Color.WHITE : 0, 9));
-                }
+        if (preferences.getBoolean("weberin_show_xbox", true)) for (ResolveInfo app : apps) {
+            if (!app.activityInfo.packageName.startsWith("com.microsoft.xbox")) continue;
+            FrameLayout xbox = new FrameLayout(this); xbox.setFocusable(true); xbox.setBackground(WeberinUi.round(0xfff5f5f7, 0, 18));
+            xbox.setContentDescription("Xbox"); put(xbox, new WeberinUi.XboxIcon(this), 25, 17, 32, 32);
+            put(xbox, text("XBOX", 24, 0xff202023, true), 73, 0, 86, 66);
+            xbox.setOnClickListener(v -> launch.open(app)); xbox.setOnFocusChangeListener((v, focus) -> xbox.setBackground(WeberinUi.round(0xfff5f5f7, focus ? 0xff92acc6 : 0, 18)));
+            xbox.setOnKeyListener((v, key, event) -> {
+                if (event.getAction() != KeyEvent.ACTION_DOWN) return false;
+                if (key == KeyEvent.KEYCODE_DPAD_UP) { tabs[0].requestFocus(); return true; }
+                if (key == KeyEvent.KEYCODE_DPAD_DOWN) { if (!cards.isEmpty()) cards.get(0).requestFocus(); else tabs[0].requestFocus(); return true; }
+                return key == KeyEvent.KEYCODE_DPAD_LEFT || key == KeyEvent.KEYCODE_DPAD_RIGHT;
             });
-            item.setOnClickListener(v -> fillSettings(details, category));
-            settingsCategoryRows.add(item);
-            sidebar.addView(item, new LinearLayout.LayoutParams(-1, dp(42)));
-            if (i == 0) item.post(item::requestFocus);
-        }
-        fillSettings(details, 0);
-    }
-
-    private void fillSettings(LinearLayout details, int category) {
-        details.removeAllViews();
-        int[] categories = {R.string.weberin_settings_apps, R.string.weberin_settings_system,
-                R.string.weberin_settings_display, R.string.weberin_settings_sound,
-                R.string.weberin_settings_themes, R.string.weberin_settings_other};
-        TextView title = label(getString(categories[category]), 22, Color.WHITE);
-        title.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
-        details.addView(title, new LinearLayout.LayoutParams(-1, dp(50)));
-        ScrollView scroll = new ScrollView(this);
-        LinearLayout rows = new LinearLayout(this);
-        rows.setOrientation(LinearLayout.VERTICAL);
-        scroll.addView(rows);
-        details.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1));
-        if (category == 0) {
-            for (ResolveInfo app : apps) {
-                TextView row = button(app.loadLabel(getPackageManager()).toString() + "  ›", () -> {
-                    Intent intent = new Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                            android.net.Uri.parse("package:" + app.activityInfo.packageName));
-                    openSettingsTarget(intent);
-                });
-                rows.addView(row, new LinearLayout.LayoutParams(-1, dp(48)));
-            }
-        } else if (category == 1) {
-            addSettingsRow(rows, R.string.tv_settings, new Intent(android.provider.Settings.ACTION_SETTINGS));
-            addSettingsRow(rows, R.string.home_settings, new Intent(this, HomeSettingsActivity.class));
-        } else if (category == 2) {
-            addToggleRow(rows, R.string.weberin_clock, "weberin_show_clock");
-            addToggleRow(rows, R.string.weberin_favorites, "weberin_show_favorites");
-            addToggleRow(rows, R.string.weberin_weather_title, "weberin_show_weather");
-            TextView weatherCityChoice = button(getString(R.string.weberin_weather_city), this::showWeatherCityPicker);
-            rows.addView(weatherCityChoice, new LinearLayout.LayoutParams(-1, dp(48)));
-            addStockToggleRow(rows, R.string.visibility_network, "visible_network", Config.load(this).showNetworkPill);
-            addIntChoiceRow(rows, R.string.columns_label, "columns", new int[]{4, 5, 6, 7}, Config.load(this).columns);
-            addIntChoiceRow(rows, R.string.dock_opacity_label, Config.DOCK_OPACITY_KEY, new int[]{100, 70, 50, 30}, Config.load(this).dockOpacity);
-            addClockChoiceRow(rows);
-            addStockToggleRow(rows, R.string.animations_state, "animations", Config.load(this).animations);
-            addSettingsRow(rows, R.string.weberin_settings_display, new Intent(android.provider.Settings.ACTION_DISPLAY_SETTINGS));
-            addSettingsRow(rows, R.string.launcher_settings, new Intent(this, LauncherSettingsActivity.class));
-        } else if (category == 3) {
-            addSettingsRow(rows, R.string.weberin_settings_sound, new Intent(android.provider.Settings.ACTION_SOUND_SETTINGS));
-        } else {
-            if (category == 4) {
-                TextView wallpaper = button(getString(R.string.weberin_wallpaper) + "  ›", this::showBundledWallpaperPicker);
-                rows.addView(wallpaper, new LinearLayout.LayoutParams(-1, dp(48)));
-                TextView original = button(getString(R.string.layout_original) + "  ›", () -> {
-                    preferences.edit().putBoolean("weberin_layout", false).apply();
-                    finish();
-                });
-                rows.addView(original, new LinearLayout.LayoutParams(-1, dp(48)));
-            }
-            addSettingsRow(rows, R.string.launcher_settings, new Intent(this, LauncherSettingsActivity.class));
-            if (category == 5) addSettingsRow(rows, R.string.tv_settings, new Intent(android.provider.Settings.ACTION_SETTINGS));
+            homeAction = xbox; put(pageContent, xbox, 96, 616, 165, 66); break;
         }
     }
-
-    private void addToggleRow(LinearLayout rows, int text, String key) {
-        TextView row = button("", () -> {});
-        Runnable refresh = () -> row.setText(getString(text) + ": " +
-                getString(preferences.getBoolean(key, true) ? R.string.on : R.string.off));
-        row.setOnClickListener(v -> {
-            preferences.edit().putBoolean(key, !preferences.getBoolean(key, true)).apply();
-            refresh.run();
-        });
-        refresh.run();
-        rows.addView(row, new LinearLayout.LayoutParams(-1, dp(48)));
-    }
-
-    private void showWeatherCityPicker() {
-        android.widget.EditText input = new android.widget.EditText(this);
-        input.setSingleLine(true);
-        input.setText(preferences.getString("weberin_weather_city", getString(R.string.weberin_weather_default_city)));
-        new android.app.AlertDialog.Builder(this).setTitle(R.string.weberin_weather_city).setView(input)
-                .setPositiveButton(android.R.string.ok, (dialog, which) -> {
-                    String city = input.getText().toString().trim();
-                    if (city.length() < 2 || city.length() > 80) {
-                        Toast.makeText(this, R.string.weberin_weather_invalid_city, Toast.LENGTH_LONG).show();
-                        return;
-                    }
-                    preferences.edit().putString("weberin_weather_city", city).apply();
-                    weatherCheckedAt = 0;
-                    weatherCityLoaded = "";
-                    weatherReading = null;
-                    weatherFailed = false;
-                }).setNegativeButton(android.R.string.cancel, null).show();
-    }
-
-    private void addWeatherPanel(FrameLayout root) {
-        weatherPanel = new LinearLayout(this);
-        weatherPanel.setOrientation(LinearLayout.VERTICAL);
-        weatherPanel.setGravity(Gravity.CENTER);
-        weatherPanel.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
-        FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(dp(190), dp(220), Gravity.END | Gravity.CENTER_VERTICAL);
-        params.setMargins(0, 0, dp(44), dp(64));
-        root.addView(weatherPanel, params);
-        updateWeatherPanel();
-        requestWeatherIfNeeded();
-    }
-
-    private void weatherLine(String value, int size, int color, boolean bold) {
-        TextView text = label(value, size, color);
-        text.setGravity(Gravity.CENTER);
-        if (bold) text.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
-        weatherPanel.addView(text, new LinearLayout.LayoutParams(-1, -2));
-    }
-
+    private void addWeatherPanel() { weatherPanel = new FrameLayout(this); put(pageContent, weatherPanel, 1512, 290, 312, 330); updateWeatherPanel(); requestWeatherIfNeeded(); }
+    private void weatherLine(CharSequence value, int size, int color, int y, int height) { TextView line = text(value, size, color, false); line.setGravity(Gravity.CENTER); put(weatherPanel, line, 0, y, 312, height); }
     private void updateWeatherPanel() {
-        if (weatherPanel == null) return;
-        weatherPanel.removeAllViews();
-        String requestedCity = preferences.getString("weberin_weather_city", getString(R.string.weberin_weather_default_city));
-        WeberinWeather.Reading reading = requestedCity.equals(weatherCityLoaded) ? weatherReading : null;
-        weatherLine(reading == null ? requestedCity : reading.city, 17, Color.WHITE, true);
-        if (reading == null) {
-            weatherLine(getString(weatherFailed && requestedCity.equals(weatherCityLoaded)
-                    ? R.string.weberin_weather_unavailable : R.string.weberin_weather_loading), 11, 0xffb1b8c7, false);
-            return;
-        }
-        weatherLine(getString(R.string.weberin_weather_humidity, reading.humidity), 11, 0xffb1b8c7, false);
-        int condition = WeberinWeather.condition(reading.code);
-        String[] icons = {"☀", "☁", "≋", "☂", "❄", "ϟ"};
-        int[] descriptions = {R.string.weberin_weather_clear, R.string.weberin_weather_cloudy,
-                R.string.weberin_weather_fog, R.string.weberin_weather_rain,
-                R.string.weberin_weather_snow, R.string.weberin_weather_storm};
-        weatherLine(icons[condition], 28, 0xffd6e6ef, false);
-        weatherLine(String.format(java.util.Locale.getDefault(), "%d°", reading.temperature), 40, Color.WHITE, false);
-        weatherLine(getString(descriptions[condition]), 14, Color.WHITE, false);
-        weatherLine(getString(R.string.weberin_weather_range, reading.low, reading.high), 10, 0xffb1b8c7, false);
-        weatherLine("Open-Meteo.com", 8, 0xff969eac, false);
+        if (weatherPanel == null) return; weatherPanel.removeAllViews();
+        String requested = preferences.getString("weberin_weather_city", getString(R.string.weberin_weather_default_city));
+        WeberinWeather.Reading reading = requested.equals(weatherCityLoaded) ? weatherReading : null;
+        weatherLine(reading == null ? requested : reading.city, 22, WeberinUi.WHITE, 0, 34);
+        if (reading == null) { weatherLine(getString(weatherFailed && requested.equals(weatherCityLoaded) ? R.string.weberin_weather_unavailable : R.string.weberin_weather_loading), 16, WeberinUi.MUTED, 44, 30); return; }
+        weatherLine(getString(R.string.weberin_weather_humidity, reading.humidity), 16, 0xffacbece, 34, 28);
+        int condition = WeberinWeather.condition(reading.code); put(weatherPanel, new WeberinUi.WeatherIcon(this, condition), 124, 78, 64, 66);
+        TextView temperature = text(String.format(Locale.getDefault(), "%s%d°", reading.temperature < 0 ? "−" : "", Math.abs(reading.temperature)), 70, Color.WHITE, false);
+        temperature.setTypeface(WeberinUi.font(this, 300)); temperature.setGravity(Gravity.CENTER); put(weatherPanel, temperature, 0, 133, 312, 80);
+        int[] descriptions = {R.string.weberin_weather_clear, R.string.weberin_weather_cloudy, R.string.weberin_weather_fog, R.string.weberin_weather_rain, R.string.weberin_weather_snow, R.string.weberin_weather_storm};
+        weatherLine(getString(descriptions[condition]), 22, 0xffe0e7ef, 220, 32);
+        weatherLine(getString(R.string.weberin_weather_range, reading.low, reading.high), 16, 0xffacbece, 268, 30); weatherLine("Open-Meteo.com", 11, 0xff86909c, 305, 20);
     }
-
     private void requestWeatherIfNeeded() {
-        String city = preferences.getString("weberin_weather_city", getString(R.string.weberin_weather_default_city));
-        long now = android.os.SystemClock.elapsedRealtime();
-        long interval = weatherFailed ? 5 * 60_000L : 30 * 60_000L;
-        if (city.equals(weatherCityPending) || city.equals(weatherCityLoaded) && now - weatherCheckedAt < interval) return;
-        weatherCityPending = city;
-        int generation = ++weatherGeneration;
-        String language = getResources().getConfiguration().locale.getLanguage();
+        String city = preferences.getString("weberin_weather_city", getString(R.string.weberin_weather_default_city)); long interval = weatherFailed ? 5 * 60_000L : 30 * 60_000L;
+        if (city.equals(weatherCityPending) || city.equals(weatherCityLoaded) && SystemClock.elapsedRealtime() - weatherCheckedAt < interval) return;
+        weatherCityPending = city; int generation = ++weatherGeneration; String language = getResources().getConfiguration().getLocales().get(0).getLanguage();
         weatherExecutor.execute(() -> {
-            WeberinWeather.Reading reading = null;
-            try { reading = WeberinWeather.fetch(city, language); }
-            catch (java.io.IOException | org.json.JSONException ignored) { }
-            final WeberinWeather.Reading result = reading;
-            runOnUiThread(() -> {
+            WeberinWeather.Reading result = null; try { result = WeberinWeather.fetch(city, language); } catch (IOException | org.json.JSONException | RuntimeException ignored) { }
+            final WeberinWeather.Reading reading = result; runOnUiThread(() -> {
                 if (isFinishing() || isDestroyed() || generation != weatherGeneration) return;
-                weatherCityPending = "";
-                weatherCityLoaded = city;
-                weatherReading = result;
-                weatherFailed = result == null;
-                weatherCheckedAt = android.os.SystemClock.elapsedRealtime();
-                updateWeatherPanel();
+                weatherCityPending = ""; weatherCityLoaded = city; weatherReading = reading; weatherFailed = reading == null; weatherCheckedAt = SystemClock.elapsedRealtime(); updateWeatherPanel();
             });
         });
     }
-
-    @Override protected void onDestroy() {
-        weatherGeneration++;
-        weatherExecutor.shutdownNow();
-        super.onDestroy();
+    private void showSettings() {
+        if (overlay != null) return;
+        // Keep the two panels modal even if firmware chooses its own geometric focus neighbour.
+        for (int i = 0; i < scene.getChildCount(); i++) {
+            View child = scene.getChildAt(i);
+            child.setFocusable(false);
+            child.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS);
+            if (child instanceof android.view.ViewGroup) ((android.view.ViewGroup) child)
+                    .setDescendantFocusability(android.view.ViewGroup.FOCUS_BLOCK_DESCENDANTS);
+        }
+        List<ResolveInfo> ordered = orderedApps();
+        settingsPanel = new WeberinSettings(this, ordered); overlay = settingsPanel.create(); put(scene, overlay, 0, 0, 1920, 1080);
     }
-
-    private void markSettingsChanged() {
-        preferences.edit().putLong(Config.SETTINGS_REVISION_KEY,
-                preferences.getLong(Config.SETTINGS_REVISION_KEY, 0) + 1).apply();
+    @Override public void onBackPressed() {
+        if (settingsPanel != null) { settingsPanel.handleBack(); return; }
+        if (page != 0) { focusedTab = -1; selectPage(0); if (!cards.isEmpty()) cards.get(0).requestFocus(); else tabs[0].requestFocus(); }
+        else moveTaskToBack(true);
     }
-
-    private void addStockToggleRow(LinearLayout rows, int text, String key, boolean fallback) {
-        TextView row = button("", () -> {});
-        Runnable refresh = () -> {
-            String state = getString(preferences.getBoolean(key, fallback) ? R.string.on : R.string.off);
-            row.setText(text == R.string.animations_state ? getString(text, state) : getString(text) + ": " + state);
-        };
-        row.setOnClickListener(v -> {
-            boolean value = !preferences.getBoolean(key, fallback);
-            android.content.SharedPreferences.Editor edit = preferences.edit().putBoolean(key, value);
-            if ("animations".equals(key) && !value) edit.putBoolean("advanced_effects", false);
-            edit.apply();
-            markSettingsChanged();
-            refresh.run();
-        });
-        refresh.run();
-        rows.addView(row, new LinearLayout.LayoutParams(-1, dp(48)));
+    @Override public Activity activity() { return this; }
+    @Override public SharedPreferences preferences() { return preferences; }
+    @Override public void onSettingsChanged() { config = Config.load(this); launch = new WeberinLaunch(this, config); banners.clear(); }
+    @Override public void onCloseSettings() {
+        if (overlay != null) scene.removeView(overlay); overlay = null; settingsPanel = null;
+        config = Config.load(this); launch = new WeberinLaunch(this, config); render(); scene.post(() -> settingsButton.requestFocus());
     }
-
-    private void addIntChoiceRow(LinearLayout rows, int labelId, String key, int[] values, int fallback) {
-        TextView row = button("", () -> {});
-        Runnable refresh = () -> row.setText(getString(labelId) + ": " + preferences.getInt(key, fallback));
-        row.setOnClickListener(v -> {
-            String[] labels = new String[values.length];
-            int selected = -1;
-            int current = preferences.getInt(key, fallback);
-            for (int i = 0; i < values.length; i++) {
-                labels[i] = String.valueOf(values[i]);
-                if (values[i] == current) selected = i;
-            }
-            new android.app.AlertDialog.Builder(this).setTitle(labelId)
-                    .setSingleChoiceItems(labels, selected, (dialog, which) -> {
-                        preferences.edit().putInt(key, values[which]).apply();
-                        markSettingsChanged();
-                        refresh.run();
-                        dialog.dismiss();
-                    }).setNegativeButton(android.R.string.cancel, null).show();
-        });
-        refresh.run();
-        rows.addView(row, new LinearLayout.LayoutParams(-1, dp(48)));
+    @Override public void onOriginalInterface() { preferences.edit().putBoolean("weberin_layout", false).apply(); finish(); }
+    @Override public void onWallpaperPicker() { showWallpaperPicker(); }
+    @Override public void onLauncherSettings() { startActivityForResult(new Intent(this, LauncherSettingsActivity.class), 71); }
+    @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == 71 && resultCode == RESULT_OK && data != null
+                && data.getBooleanExtra(LauncherSettingsActivity.EXTRA_REORDER, false)) {
+            startActivity(new Intent(this, MainActivity.class).putExtra(LauncherSettingsActivity.EXTRA_REORDER, true));
+            finish();
+        }
     }
-
-    private void addClockChoiceRow(LinearLayout rows) {
-        TextView row = button(getString(R.string.dream_name), () -> {
-            String[] values = {"system", "12", "24"};
-            String[] labels = {getString(R.string.clock_format_system), getString(R.string.clock_format_12), getString(R.string.clock_format_24)};
-            String selected = preferences.getString(Config.CLOCK_FORMAT_KEY, Config.load(this).clockFormat);
-            int index = java.util.Arrays.asList(values).indexOf(selected);
-            new android.app.AlertDialog.Builder(this).setTitle(R.string.dream_name)
-                    .setSingleChoiceItems(labels, index, (dialog, which) -> {
-                        preferences.edit().putString(Config.CLOCK_FORMAT_KEY, values[which]).apply();
-                        markSettingsChanged();
-                        dialog.dismiss();
-                    }).setNegativeButton(android.R.string.cancel, null).show();
-        });
-        rows.addView(row, new LinearLayout.LayoutParams(-1, dp(48)));
+    @Override public void onWeatherCityPicker() { showWeatherCityPicker(); }
+    @Override public void onReleaseLauncherMemory() { banners.clear(); wallpaper = null; wallpaperKey = null; }
+    @Override public void openStartupIntent(Intent intent) { launch.openIntent(intent); }
+    @Override public void openStartupInput(String inputId) { launch.openInput(inputId); }
+    private void showWeatherCityPicker() {
+        EditText input = new EditText(this); input.setSingleLine(); input.setText(preferences.getString("weberin_weather_city", getString(R.string.weberin_weather_default_city)));
+        AlertDialog dialog = new AlertDialog.Builder(this).setTitle(R.string.weberin_weather_city).setView(input).setPositiveButton(android.R.string.ok, null).setNegativeButton(android.R.string.cancel, null).create();
+        dialog.setOnShowListener(ignored -> dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
+            String city = input.getText().toString().trim(); if (city.length() < 2 || city.length() > 80) { input.setError(getString(R.string.weberin_weather_invalid_city)); return; }
+            preferences.edit().putString("weberin_weather_city", city).apply(); weatherGeneration++; weatherCityPending = ""; weatherCityLoaded = ""; weatherReading = null; weatherCheckedAt = 0; weatherFailed = false;
+            if (settingsPanel != null) settingsPanel.refresh(); else populatePage(); dialog.dismiss();
+        })); dialog.show();
     }
-
-    private void showBundledWallpaperPicker() {
+    private void showWallpaperPicker() {
         try {
-            String[] files = getAssets().list("weberin");
-            if (files == null) return;
-            List<String> pictures = new ArrayList<>();
-            pictures.add("theme"); pictures.add("none");
-            for (String file : files) if (file.endsWith(".jpg") || file.endsWith(".png")) pictures.add(file);
-            String[] names = pictures.toArray(new String[0]);
-            names[0] = getString(R.string.wallpaper_theme_default);
-            names[1] = getString(R.string.wallpaper_none);
-            int selected = pictures.indexOf(preferences.getString("weberin_wallpaper", "01-windows-black-1080p.png"));
-            new android.app.AlertDialog.Builder(this).setTitle(R.string.weberin_wallpaper)
-                    .setSingleChoiceItems(names, selected, (dialog, which) -> {
-                        preferences.edit().putString("weberin_wallpaper", pictures.get(which)).apply();
-                        dialog.dismiss();
-                        render();
-                    }).setNegativeButton(android.R.string.cancel, null).show();
-        } catch (java.io.IOException e) {
-            Toast.makeText(this, R.string.not_available, Toast.LENGTH_SHORT).show();
-        }
+            List<String> pictures = new ArrayList<>(), names = new ArrayList<>(); pictures.add("theme"); names.add(getString(R.string.wallpaper_theme_default)); pictures.add("none"); names.add(getString(R.string.wallpaper_none));
+            String[] files = getAssets().list("weberin"); if (files != null) for (String file : files) if (file.endsWith(".jpg") || file.endsWith(".png")) {
+                pictures.add(file); names.add(file.replaceFirst("^\\d+-", "").replace(".png", "").replace(".jpg", "").replace('-', ' ')); }
+            new AlertDialog.Builder(this).setTitle(R.string.weberin_wallpaper).setSingleChoiceItems(names.toArray(new String[0]), pictures.indexOf(preferences.getString("weberin_wallpaper", DEFAULT_WALLPAPER)), (dialog, which) -> {
+                preferences.edit().putString("weberin_wallpaper", pictures.get(which)).apply(); wallpaperKey = null;
+                if (settingsPanel != null) { onSettingsChanged(); settingsPanel.refresh(); } else render(); dialog.dismiss();
+            }).setNegativeButton(android.R.string.cancel, null).show();
+        } catch (IOException e) { Toast.makeText(this, R.string.not_available, Toast.LENGTH_SHORT).show(); }
     }
-
-    private void addSettingsRow(LinearLayout rows, int text, Intent intent) {
-        TextView row = button(getString(text) + "  ›", () -> openSettingsTarget(intent));
-        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, dp(48));
-        params.bottomMargin = dp(4);
-        rows.addView(row, params);
+    private void openSettingsTarget(Intent intent) { launch.openIntent(intent); }
+    @Override public void onTrimMemory(int level) {
+        super.onTrimMemory(level); if (level >= TRIM_MEMORY_UI_HIDDEN) banners.clear(); if (level >= TRIM_MEMORY_RUNNING_CRITICAL) { wallpaper = null; wallpaperKey = null; }
     }
-
-    private void openSettingsTarget(Intent intent) {
-        try { startActivity(intent); }
-        catch (ActivityNotFoundException | SecurityException e) {
-            Toast.makeText(this, R.string.not_available, Toast.LENGTH_SHORT).show();
-        }
-    }
-
-    private View allAppsTile() {
-        int screenDp = Math.round(getResources().getDisplayMetrics().widthPixels / getResources().getDisplayMetrics().density);
-        int tileColumns = page == 1 && preferences.contains("columns")
-                ? Math.max(4, Math.min(7, activeConfig.columns)) : (page == 1 ? 5 : 6);
-        int tileWidth = Math.max(64, (screenDp - 108 - tileColumns * 12) / tileColumns);
-        LinearLayout holder = new LinearLayout(this);
-        holder.setOrientation(LinearLayout.VERTICAL);
-        holder.setGravity(Gravity.CENTER_HORIZONTAL);
-        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(dp(tileWidth), -2);
-        params.setMargins(dp(4), dp(5), dp(8), dp(6));
-        holder.setLayoutParams(params);
-        FrameLayout card = new FrameLayout(this);
-        card.setFocusable(true);
-        card.setBackground(shape(0xb31a1a1c, 0x66484a50, 12));
-        ImageView icon = new ImageView(this);
-        icon.setImageResource(R.drawable.ic_apps);
-        icon.setScaleType(ImageView.ScaleType.FIT_CENTER);
-        card.addView(icon, new FrameLayout.LayoutParams(dp(32), dp(32), Gravity.CENTER));
-        holder.addView(card, new LinearLayout.LayoutParams(-1, dp(Math.round(tileWidth * 0.57f))));
-        TextView caption = label(getString(R.string.weberin_all_short), 13, 0xffbfc6d3);
-        caption.setGravity(Gravity.CENTER);
-        holder.addView(caption, new LinearLayout.LayoutParams(-1, dp(26)));
-        card.setOnFocusChangeListener((v, focused) -> {
-            card.setBackground(shape(focused ? 0xff303135 : 0xb31a1a1c, focused ? Color.WHITE : 0x66484a50, 12));
-            caption.setTextColor(focused ? Color.WHITE : 0xffbfc6d3);
-        });
-        card.setOnClickListener(v -> { page = 1; focusedPackage = null; focusSelectedTab = true; render(); });
-        return holder;
-    }
-
-    private View tile(ResolveInfo app) {
-        String name = app.loadLabel(getPackageManager()).toString();
-        int screenDp = Math.round(getResources().getDisplayMetrics().widthPixels / getResources().getDisplayMetrics().density);
-        int tileColumns = page == 1 && preferences.contains("columns")
-                ? Math.max(4, Math.min(7, activeConfig.columns)) : (page == 1 ? 5 : 6);
-        int tileWidth = Math.max(64, (screenDp - 108 - tileColumns * 12) / tileColumns);
-        LinearLayout holder = new LinearLayout(this);
-        holder.setOrientation(LinearLayout.VERTICAL);
-        holder.setGravity(Gravity.CENTER_HORIZONTAL);
-        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(dp(tileWidth), -2);
-        params.setMargins(dp(4), dp(5), dp(8), dp(6));
-        holder.setLayoutParams(params);
-        FrameLayout card = new FrameLayout(this);
-        card.setFocusable(true);
-        card.setBackground(shape(0xb31a1a1c, 0x66484a50, 12));
-        card.setClipToOutline(true);
-        holder.addView(card, new LinearLayout.LayoutParams(-1, dp(Math.round(tileWidth * 0.57f))));
-        android.graphics.drawable.Drawable banner = app.activityInfo.loadBanner(getPackageManager());
-        ImageView art = new ImageView(this);
-        if (banner != null) {
-            art.setImageDrawable(banner);
-            art.setScaleType(ImageView.ScaleType.FIT_XY);
-            card.addView(art, new FrameLayout.LayoutParams(-1, -1, Gravity.CENTER));
-        } else {
-            TextView appName = label(name, 17, Color.WHITE);
-            appName.setGravity(Gravity.CENTER);
-            appName.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
-            appName.setPadding(dp(6), 0, dp(6), 0);
-            card.addView(appName, new FrameLayout.LayoutParams(-1, -1));
-        }
-        TextView caption = label(name, 13, 0xffbfc6d3);
-        caption.setGravity(Gravity.CENTER);
-        caption.setSingleLine(true);
-        caption.setEllipsize(android.text.TextUtils.TruncateAt.END);
-        holder.addView(caption, new LinearLayout.LayoutParams(-1, dp(26)));
-        card.setOnClickListener(v -> {
-            Intent intent = new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
-                    .setClassName(app.activityInfo.packageName, app.activityInfo.name).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-            try { startActivity(intent); }
-            catch (ActivityNotFoundException | SecurityException e) { Toast.makeText(this, R.string.not_available, Toast.LENGTH_SHORT).show(); }
-        });
-        card.setOnLongClickListener(v -> {
-            showTileMenu(app);
-            return true;
-        });
-        card.setOnFocusChangeListener((v, focused) -> {
-            card.setBackground(shape(focused ? 0xe51a1a1c : 0xb31a1a1c, focused ? Color.WHITE : 0x66484a50, 12));
-            card.setForeground(shape(Color.TRANSPARENT, focused ? Color.WHITE : 0, 12));
-            float scale = focused && activeConfig.animations ? 1.03f : 1f;
-            card.setScaleX(scale);
-            card.setScaleY(scale);
-            caption.setTextColor(focused ? Color.WHITE : 0xffbfc6d3);
-            if (focused && !restoringFocus) focusedPackage = app.activityInfo.packageName;
-        });
-        if (app.activityInfo.packageName.equals(focusedPackage))
-            card.post(() -> { restoringFocus = true; card.requestFocus(); restoringFocus = false; });
-        return holder;
-    }
+    @Override protected void onDestroy() { weatherGeneration++; weatherExecutor.shutdownNow(); startup.close(); banners.clear(); wallpaper = null; super.onDestroy(); }
 }

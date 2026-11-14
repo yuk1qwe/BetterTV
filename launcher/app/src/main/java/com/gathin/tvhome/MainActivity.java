@@ -303,6 +303,8 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     private final BroadcastReceiver wakeReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
+            // The selected alternate home owns its wake launch, including the network wait.
+            if (getSharedPreferences(Config.SETTINGS_NAME, MODE_PRIVATE).getBoolean("weberin_layout", true)) return;
             openStartAppOnWake();
         }
     };
@@ -314,6 +316,8 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     /** The grid has been laid out and focused since the last resume; the card prompt waits for this. */
     private boolean tilesReady;
     private boolean settingsRecreationPending;
+    /** The original reorder editor was opened from Weberin; completing it returns to that presentation. */
+    private boolean weberinReorderSession;
     private Dialog cardPrompt;
     /** Set when a decision could not be saved: no more prompts until the next resume, instead of asking in a loop. */
     private boolean promptsPaused;
@@ -1054,6 +1058,15 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     @Override
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
+        if (intent != null && intent.getBooleanExtra(LauncherSettingsActivity.EXTRA_REORDER, false)) {
+            // A request from the alternate home's settings must reach the same original editor as
+            // onActivityResult. singleTask already removed the alternate activity from this task.
+            getIntent().putExtra(LauncherSettingsActivity.EXTRA_REORDER, true);
+            settingsRecreationPending = true;
+            settingsRevision = settingsRevision();
+            recreate();
+            return;
+        }
         if (openLauncherSettingsIfAsked(intent)) return;
         if (openLibraryIfAsked(intent)) return;
         if (openInputsIfAsked(intent)) return;
@@ -1090,10 +1103,6 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     protected void onResume() {
         super.onResume();
         resumed = true;
-        if (getSharedPreferences(Config.SETTINGS_NAME, MODE_PRIVATE).getBoolean("weberin_layout", true)) {
-            startActivity(new Intent(this, WeberinActivity.class));
-            return;
-        }
         // A festival that started or ended while Home was in the background: rebuild with or without it.
         if (festive != festival.active(LocalDate.now())) {
             recreate();
@@ -1104,6 +1113,14 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         // back cancelled, so a new wallpaper or layout waited for the next process start.
         if (Config.settingsChanged(settingsRevision, settingsRevision())) {
             recreate();
+            return;
+        }
+        // Refresh settings before opening the selected presentation. Reorder is an explicit request for
+        // the original editor, so let that request finish even while Weberin is the preferred home.
+        if (getSharedPreferences(Config.SETTINGS_NAME, MODE_PRIVATE).getBoolean("weberin_layout", true)
+                && !getIntent().getBooleanExtra(LauncherSettingsActivity.EXTRA_REORDER, false)
+                && !weberinReorderSession && !reordering) {
+            startActivity(new Intent(this, WeberinActivity.class));
             return;
         }
         restartIdleClock();
@@ -1180,7 +1197,10 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         if (settingsRecreationPending || !tilesReady || !hasWindowFocus() || isFinishing()
                 || !getIntent().getBooleanExtra(LauncherSettingsActivity.EXTRA_REORDER, false)) return;
         getIntent().removeExtra(LauncherSettingsActivity.EXTRA_REORDER);
+        weberinReorderSession = getSharedPreferences(Config.SETTINGS_NAME, MODE_PRIVATE)
+                .getBoolean("weberin_layout", true);
         toggleReorder();
+        if (!reordering) returnFromWeberinReorder();
     }
 
     /** Rebuilds the tiles (and the module cards), then puts focus back where it was. */
@@ -1344,6 +1364,10 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         handler.removeCallbacks(clockCheck);
         stopped = true;
         tileRefresh.onStop();
+        // Weberin draws its own wallpaper and cards. Keep the original editor ready to return to,
+        // without retaining a second set of app artwork underneath the selected presentation.
+        if (!reordering && getSharedPreferences(Config.SETTINGS_NAME, MODE_PRIVATE)
+                .getBoolean("weberin_layout", true)) releaseHiddenArtwork();
     }
 
     /**
@@ -1357,6 +1381,11 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         // RUNNING_LOW and CRITICAL also arrive while Home is visible when an accessibility service keeps the
         // process in the foreground; never blank the screen the owner is looking at.
         if (!MemoryTrimPolicy.shouldRelease(level, started)) return;
+        releaseHiddenArtwork();
+    }
+
+    /** Uses the existing pressure recovery path; onResume rebuilds these resources if the original home returns. */
+    private void releaseHiddenArtwork() {
         adapter.clear();
         // Detach the adapter too: with Home stopped no layout pass runs, so the tile views (and the bitmaps
         // they hold) would stay attached until Home comes back. setAdapter(null) recycles them now.
@@ -1364,6 +1393,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         grid.getRecycledViewPool().clear();
         heroArtCache.clear();
         heroArtKey = null;
+        heroArt.setImageDrawable(null);
         wallpaperPlayer.releaseForMemoryPressure();
         tileRefresh.invalidate();
     }
@@ -1697,6 +1727,21 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
             }
         }
         if (fillDockLeavesSlots) reloadTiles();   // the empty dock slots left out while reordering come back
+        returnFromWeberinReorder();
+    }
+
+    private void returnFromWeberinReorder() {
+        if (!weberinReorderSession) return;
+        weberinReorderSession = false;
+        // onPause also ends reorder to save the owner's choices. In that case do not interrupt the
+        // app they just opened; onResume will select their preferred presentation when they return.
+        if (!resumed) return;
+        root.post(() -> {
+            if (resumed && !isFinishing() && !isDestroyed() && !reordering
+                    && getSharedPreferences(Config.SETTINGS_NAME, MODE_PRIVATE).getBoolean("weberin_layout", true)) {
+                startActivity(new Intent(this, WeberinActivity.class));
+            }
+        });
     }
 
     /**

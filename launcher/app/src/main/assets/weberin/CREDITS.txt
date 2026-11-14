@@ -4,3 +4,7 @@ https://4kwallpapers.com/abstract/windows-11-dark-mode-abstract-background-dark-
 https://4kwallpapers.com/abstract/galaxy-tab-s8-samsung-stock-amoled-dark-mode-black-7524.html
 https://4kwallpapers.com/nature/macos-mojave-sand-dunes-mojave-desert-california-night-dark-4051.html
 https://4kwallpapers.com/nature/macos-big-sur-stock-night-sedimentary-rocks-desert-starry-3777.html
+
+Inter typeface by Rasmus Andersson and contributors:
+https://github.com/google/fonts/tree/main/ofl/inter
+SIL Open Font License 1.1; see Inter-OFL.txt in this directory.
